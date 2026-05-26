@@ -1,0 +1,244 @@
+<mujoco model="blindtouch_radial_tactile_claw">
+  <!--
+     model:
+    - vertical palm actuator and three radial closing actuators
+    - collidable pad and nine built-in touch regions per finger
+    - rigid mystery-object placeholder for smoke tests
+  -->
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.002" integrator="implicitfast" gravity="0 0 -9.81"
+          cone="elliptic" iterations="50"/>
+  <statistic center="0 0 0.08" extent="0.28"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.35 0.35 0.35"/>
+    <rgba haze="0.15 0.20 0.25 1"/>
+    <global azimuth="135" elevation="-25"/>
+  </visual>
+
+  <default>
+    <joint damping="0.8" armature="0.002"/>
+    <geom margin="0.001"/>
+
+    <!-- make structural bodies visible -->
+    <default class="structure">
+      <geom contype="0" conaffinity="0" material="frame"/>
+    </default>
+
+    <!-- only pads collide with mystery objects; they do not collide with the table. -->
+    <default class="pad">
+      <geom contype="2" conaffinity="4" condim="4" friction="1.0 0.01 0.001"
+            solref="0.01 1" solimp="0.90 0.99 0.001" material="pad"/>
+    </default>
+
+    <!-- bitmasks: table=1, pads=2, object=4 -->
+    <default class="table_contact">
+      <geom contype="1" conaffinity="4" condim="4" friction="0.9 0.01 0.001"
+            solref="0.01 1" solimp="0.90 0.99 0.001"/>
+    </default>
+
+    <default class="object_contact">
+      <geom contype="4" conaffinity="3" condim="4" friction="0.8 0.01 0.001"
+            solref="0.01 1" solimp="0.90 0.99 0.001"/>
+    </default>
+
+    <!-- touch sites collect normal contact force inside their volume. -->
+    <default class="taxel">
+      <site type="box" size="0.002 0.006 0.007"
+            rgba="0.95 0.25 0.10 0.35" group="3"/>
+    </default>
+
+    <default class="pad_zone">
+      <site type="box" size="0.0025 0.0235 0.0275"
+            rgba="0 0 0 0" group="4"/>
+    </default>
+  </default>
+
+  <asset>
+    <material name="floor" rgba="0.18 0.21 0.25 1"/>
+    <material name="frame" rgba="0.28 0.34 0.42 1"/>
+    <material name="rail" rgba="0.42 0.48 0.55 1"/>
+    <material name="pad" rgba="0.12 0.55 0.70 1"/>
+    <material name="object" rgba="0.92 0.60 0.18 1"/>
+  </asset>
+
+  <worldbody>
+    <light name="key_light" pos="0.25 -0.25 0.40" dir="-0.4 0.4 -1"/>
+    <camera name="overview" pos="0.28 -0.28 0.22" xyaxes="0.707 0.707 0 -0.30 0.30 0.906"/>
+    <geom name="table" class="table_contact" type="plane" size="0.32 0.32 0.01"
+          material="floor"/>
+
+    <!-- positive palm_lift motion raises the entire claw and any grasped object. -->
+    <body name="palm" pos="0 0 0.11">
+      <joint name="palm_lift" type="slide" axis="0 0 1" range="0 0.14"/>
+      <geom name="palm_shell" class="structure" type="cylinder" size="0.052 0.010"
+            mass="0.18"/>
+      <geom name="palm_cap" class="structure" type="cylinder" pos="0 0 0.012"
+            size="0.032 0.004" mass="0.04"/>
+      <geom name="finger_1_rail" class="structure" material="rail" type="box"
+            pos="0.062 0 -0.018" size="0.034 0.006 0.004" mass="0.01"/>
+      <geom name="finger_2_rail" class="structure" material="rail" type="box"
+            pos="-0.031 0.053694 -0.018" euler="0 0 2.09439510239"
+            size="0.034 0.006 0.004" mass="0.01"/>
+      <geom name="finger_3_rail" class="structure" material="rail" type="box"
+            pos="-0.031 -0.053694 -0.018" euler="0 0 -2.09439510239"
+            size="0.034 0.006 0.004" mass="0.01"/>
+      <site name="palm_frame" type="sphere" size="0.003" rgba="0.30 0.85 0.40 1"
+            group="4"/>
+      <site name="grasp_center" type="sphere" pos="0 0 -0.070" size="0.003"
+            rgba="0.95 0.95 0.20 0.5" group="4"/>
+
+      <!-- finger local -X points inward. all fingers share the same simple design. -->
+      <body name="finger_1" pos="0.085 0 -0.070">
+        <joint name="finger_1_close" type="slide" axis="-1 0 0" range="0 0.055"/>
+        <geom name="finger_1_link" class="structure" type="box"
+              pos="0.012 0 0.042" size="0.007 0.013 0.042" mass="0.025"/>
+        <geom name="finger_1_carrier" class="structure" type="box"
+              pos="0.006 0 0" size="0.004 0.026 0.031" mass="0.012"/>
+        <geom name="finger_1_pad" class="pad" type="box"
+              size="0.008 0.023 0.027" mass="0.008"/>
+
+        <site name="finger_1_pad_zone" class="pad_zone" pos="-0.008 0 0"/>
+        <site name="finger_1_taxel_r0_c0" class="taxel" pos="-0.008 -0.015 0.018"/>
+        <site name="finger_1_taxel_r0_c1" class="taxel" pos="-0.008 0 0.018"/>
+        <site name="finger_1_taxel_r0_c2" class="taxel" pos="-0.008 0.015 0.018"/>
+        <site name="finger_1_taxel_r1_c0" class="taxel" pos="-0.008 -0.015 0"/>
+        <site name="finger_1_taxel_r1_c1" class="taxel" pos="-0.008 0 0"/>
+        <site name="finger_1_taxel_r1_c2" class="taxel" pos="-0.008 0.015 0"/>
+        <site name="finger_1_taxel_r2_c0" class="taxel" pos="-0.008 -0.015 -0.018"/>
+        <site name="finger_1_taxel_r2_c1" class="taxel" pos="-0.008 0 -0.018"/>
+        <site name="finger_1_taxel_r2_c2" class="taxel" pos="-0.008 0.015 -0.018"/>
+      </body>
+
+      <body name="finger_2" pos="-0.0425 0.073612 -0.070" euler="0 0 2.09439510239">
+        <joint name="finger_2_close" type="slide" axis="-1 0 0" range="0 0.055"/>
+        <geom name="finger_2_link" class="structure" type="box"
+              pos="0.012 0 0.042" size="0.007 0.013 0.042" mass="0.025"/>
+        <geom name="finger_2_carrier" class="structure" type="box"
+              pos="0.006 0 0" size="0.004 0.026 0.031" mass="0.012"/>
+        <geom name="finger_2_pad" class="pad" type="box"
+              size="0.008 0.023 0.027" mass="0.008"/>
+
+        <site name="finger_2_pad_zone" class="pad_zone" pos="-0.008 0 0"/>
+        <site name="finger_2_taxel_r0_c0" class="taxel" pos="-0.008 -0.015 0.018"/>
+        <site name="finger_2_taxel_r0_c1" class="taxel" pos="-0.008 0 0.018"/>
+        <site name="finger_2_taxel_r0_c2" class="taxel" pos="-0.008 0.015 0.018"/>
+        <site name="finger_2_taxel_r1_c0" class="taxel" pos="-0.008 -0.015 0"/>
+        <site name="finger_2_taxel_r1_c1" class="taxel" pos="-0.008 0 0"/>
+        <site name="finger_2_taxel_r1_c2" class="taxel" pos="-0.008 0.015 0"/>
+        <site name="finger_2_taxel_r2_c0" class="taxel" pos="-0.008 -0.015 -0.018"/>
+        <site name="finger_2_taxel_r2_c1" class="taxel" pos="-0.008 0 -0.018"/>
+        <site name="finger_2_taxel_r2_c2" class="taxel" pos="-0.008 0.015 -0.018"/>
+      </body>
+
+      <body name="finger_3" pos="-0.0425 -0.073612 -0.070" euler="0 0 -2.09439510239">
+        <joint name="finger_3_close" type="slide" axis="-1 0 0" range="0 0.055"/>
+        <geom name="finger_3_link" class="structure" type="box"
+              pos="0.012 0 0.042" size="0.007 0.013 0.042" mass="0.025"/>
+        <geom name="finger_3_carrier" class="structure" type="box"
+              pos="0.006 0 0" size="0.004 0.026 0.031" mass="0.012"/>
+        <geom name="finger_3_pad" class="pad" type="box"
+              size="0.008 0.023 0.027" mass="0.008"/>
+
+        <site name="finger_3_pad_zone" class="pad_zone" pos="-0.008 0 0"/>
+        <site name="finger_3_taxel_r0_c0" class="taxel" pos="-0.008 -0.015 0.018"/>
+        <site name="finger_3_taxel_r0_c1" class="taxel" pos="-0.008 0 0.018"/>
+        <site name="finger_3_taxel_r0_c2" class="taxel" pos="-0.008 0.015 0.018"/>
+        <site name="finger_3_taxel_r1_c0" class="taxel" pos="-0.008 -0.015 0"/>
+        <site name="finger_3_taxel_r1_c1" class="taxel" pos="-0.008 0 0"/>
+        <site name="finger_3_taxel_r1_c2" class="taxel" pos="-0.008 0.015 0"/>
+        <site name="finger_3_taxel_r2_c0" class="taxel" pos="-0.008 -0.015 -0.018"/>
+        <site name="finger_3_taxel_r2_c1" class="taxel" pos="-0.008 0 -0.018"/>
+        <site name="finger_3_taxel_r2_c2" class="taxel" pos="-0.008 0.015 -0.018"/>
+      </body>
+    </body>
+
+    <!-- note: env.py will later vary hidden properties -->
+    <body name="object" pos="0 0 0.030">
+      <freejoint name="object_free"/>
+      <geom name="object_geom" class="object_contact" type="cylinder"
+            size="0.024 0.030" mass="0.10" material="object"/>
+      <site name="object_center" type="sphere" size="0.0025"
+            rgba="1 1 1 0.65" group="4"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position name="palm_lift_target" joint="palm_lift" kp="350" kv="25"
+              ctrlrange="0 0.14" forcerange="-80 80"/>
+    <position name="finger_1_target" joint="finger_1_close" kp="220" kv="4"
+              ctrlrange="0 0.055" forcerange="-15 15"/>
+    <position name="finger_2_target" joint="finger_2_close" kp="220" kv="4"
+              ctrlrange="0 0.055" forcerange="-15 15"/>
+    <position name="finger_3_target" joint="finger_3_close" kp="220" kv="4"
+              ctrlrange="0 0.055" forcerange="-15 15"/>
+  </actuator>
+
+  <sensor>
+    <!-- Proprioception: values a real gripper could estimate from motors/encoders. -->
+    <jointpos name="palm_lift_pos" joint="palm_lift"/>
+    <jointvel name="palm_lift_vel" joint="palm_lift"/>
+    <actuatorfrc name="palm_lift_effort" actuator="palm_lift_target"/>
+    <jointpos name="finger_1_pos" joint="finger_1_close"/>
+    <jointvel name="finger_1_vel" joint="finger_1_close"/>
+    <actuatorfrc name="finger_1_effort" actuator="finger_1_target"/>
+    <jointpos name="finger_2_pos" joint="finger_2_close"/>
+    <jointvel name="finger_2_vel" joint="finger_2_close"/>
+    <actuatorfrc name="finger_2_effort" actuator="finger_2_target"/>
+    <jointpos name="finger_3_pos" joint="finger_3_close"/>
+    <jointvel name="finger_3_vel" joint="finger_3_close"/>
+    <actuatorfrc name="finger_3_effort" actuator="finger_3_target"/>
+
+    <!-- Full-pad force is useful for safety thresholds and sensor diagnostics. -->
+    <touch name="finger_1_pad_force" site="finger_1_pad_zone"/>
+    <touch name="finger_2_pad_force" site="finger_2_pad_zone"/>
+    <touch name="finger_3_pad_force" site="finger_3_pad_zone"/>
+
+    <!-- Tactile observation: 3 fingertips x 3 rows x 3 columns = 27 taxels. -->
+    <touch name="finger_1_taxel_r0_c0_force" site="finger_1_taxel_r0_c0"/>
+    <touch name="finger_1_taxel_r0_c1_force" site="finger_1_taxel_r0_c1"/>
+    <touch name="finger_1_taxel_r0_c2_force" site="finger_1_taxel_r0_c2"/>
+    <touch name="finger_1_taxel_r1_c0_force" site="finger_1_taxel_r1_c0"/>
+    <touch name="finger_1_taxel_r1_c1_force" site="finger_1_taxel_r1_c1"/>
+    <touch name="finger_1_taxel_r1_c2_force" site="finger_1_taxel_r1_c2"/>
+    <touch name="finger_1_taxel_r2_c0_force" site="finger_1_taxel_r2_c0"/>
+    <touch name="finger_1_taxel_r2_c1_force" site="finger_1_taxel_r2_c1"/>
+    <touch name="finger_1_taxel_r2_c2_force" site="finger_1_taxel_r2_c2"/>
+
+    <touch name="finger_2_taxel_r0_c0_force" site="finger_2_taxel_r0_c0"/>
+    <touch name="finger_2_taxel_r0_c1_force" site="finger_2_taxel_r0_c1"/>
+    <touch name="finger_2_taxel_r0_c2_force" site="finger_2_taxel_r0_c2"/>
+    <touch name="finger_2_taxel_r1_c0_force" site="finger_2_taxel_r1_c0"/>
+    <touch name="finger_2_taxel_r1_c1_force" site="finger_2_taxel_r1_c1"/>
+    <touch name="finger_2_taxel_r1_c2_force" site="finger_2_taxel_r1_c2"/>
+    <touch name="finger_2_taxel_r2_c0_force" site="finger_2_taxel_r2_c0"/>
+    <touch name="finger_2_taxel_r2_c1_force" site="finger_2_taxel_r2_c1"/>
+    <touch name="finger_2_taxel_r2_c2_force" site="finger_2_taxel_r2_c2"/>
+
+    <touch name="finger_3_taxel_r0_c0_force" site="finger_3_taxel_r0_c0"/>
+    <touch name="finger_3_taxel_r0_c1_force" site="finger_3_taxel_r0_c1"/>
+    <touch name="finger_3_taxel_r0_c2_force" site="finger_3_taxel_r0_c2"/>
+    <touch name="finger_3_taxel_r1_c0_force" site="finger_3_taxel_r1_c0"/>
+    <touch name="finger_3_taxel_r1_c1_force" site="finger_3_taxel_r1_c1"/>
+    <touch name="finger_3_taxel_r1_c2_force" site="finger_3_taxel_r1_c2"/>
+    <touch name="finger_3_taxel_r2_c0_force" site="finger_3_taxel_r2_c0"/>
+    <touch name="finger_3_taxel_r2_c1_force" site="finger_3_taxel_r2_c1"/>
+    <touch name="finger_3_taxel_r2_c2_force" site="finger_3_taxel_r2_c2"/>
+  </sensor>
+
+  <!-- some convenient deterministic starting states for viewer and controller tests. -->
+  <keyframe>
+    <key name="open"
+         qpos="0 0 0 0 0 0 0.030 1 0 0 0"
+         ctrl="0 0 0 0"/>
+    <key name="approach"
+         qpos="0 0.045 0.045 0.045 0 0 0.030 1 0 0 0"
+         ctrl="0 0.045 0.045 0.045"/>
+    <key name="light_contact"
+         qpos="0 0.052 0.052 0.052 0 0 0.030 1 0 0 0"
+         ctrl="0 0.052 0.052 0.052"/>
+    <key name="secure_grasp"
+         qpos="0 0.052 0.052 0.052 0 0 0.030 1 0 0 0"
+         ctrl="0 0.055 0.055 0.055"/>
+  </keyframe>
+</mujoco>
