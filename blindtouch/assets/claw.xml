@@ -25,9 +25,9 @@
       <geom contype="0" conaffinity="0" material="frame"/>
     </default>
 
-    <!-- only pads collide with mystery objects; they do not collide with the table. -->
+    <!-- Pad-object contacts are declared explicitly below so friction can vary. -->
     <default class="pad">
-      <geom contype="2" conaffinity="4" condim="4" friction="1.0 0.01 0.001"
+      <geom contype="0" conaffinity="0" condim="4" friction="1.0 0.01 0.001"
             solref="0.01 1" solimp="0.90 0.99 0.001" material="pad"/>
     </default>
 
@@ -38,7 +38,7 @@
     </default>
 
     <default class="object_contact">
-      <geom contype="4" conaffinity="3" condim="4" friction="0.8 0.01 0.001"
+      <geom contype="4" conaffinity="1" condim="4" friction="0.8 0.01 0.001"
             solref="0.01 1" solimp="0.90 0.99 0.001"/>
     </default>
 
@@ -162,6 +162,19 @@
             rgba="1 1 1 0.65" group="4"/>
     </body>
   </worldbody>
+
+  <!-- Explicit pairs prevent pad friction from masking sampled object friction. -->
+  <contact>
+    <pair name="finger_1_object_contact" geom1="finger_1_pad" geom2="object_geom"
+          condim="4" friction="0.8 0.8 0.01 0.001 0.001"
+          solref="0.01 1" solimp="0.90 0.99 0.001"/>
+    <pair name="finger_2_object_contact" geom1="finger_2_pad" geom2="object_geom"
+          condim="4" friction="0.8 0.8 0.01 0.001 0.001"
+          solref="0.01 1" solimp="0.90 0.99 0.001"/>
+    <pair name="finger_3_object_contact" geom1="finger_3_pad" geom2="object_geom"
+          condim="4" friction="0.8 0.8 0.01 0.001 0.001"
+          solref="0.01 1" solimp="0.90 0.99 0.001"/>
+  </contact>
 
   <actuator>
     <position name="palm_lift_target" joint="palm_lift" kp="350" kv="25"
