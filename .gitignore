@@ -1,2 +1,6 @@
 todo.txt
 .venv/
+log.txt
+__pycache__/
+*.py[cod]
+.pytest_cache/
