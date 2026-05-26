@@ -20,10 +20,12 @@ FloatArray = NDArray[np.float32]
 
 @dataclass(frozen=True)
 class ObjectParams:
-    """Hidden physical properties for one rigid-cylinder episode."""
+    """Hidden physical properties for one rigid primitive object episode."""
 
-    radius: float
-    half_height: float
+    shape: str
+    half_size_x: float
+    half_size_y: float
+    half_size_z: float
     mass: float
     friction: float
     safe_force: float
@@ -48,12 +50,19 @@ class EnvConfig:
     contact_force_threshold: float = 0.02
     tactile_force_scale: float = 5.0
     velocity_scale: float = 0.5
-    radius_range: tuple[float, float] = (0.023, 0.028)
-    half_height_range: tuple[float, float] = (0.023, 0.037)
-    mass_range: tuple[float, float] = (0.04, 0.18)
-    friction_range: tuple[float, float] = (0.35, 1.20)
-    safe_force_range: tuple[float, float] = (0.55, 2.20)
-    offset_range: tuple[float, float] = (-0.004, 0.004)
+    max_tilt_radians: float = np.deg2rad(40.0)
+    slip_distance_threshold: float = 0.0005
+    training_shapes: tuple[str, ...] = ("cylinder", "box", "capsule")
+    radial_size_range: tuple[float, float] = (0.023, 0.031)
+    capsule_radius_range: tuple[float, float] = (0.023, 0.028)
+    half_height_range: tuple[float, float] = (0.022, 0.040)
+    mass_range: tuple[float, float] = (0.03, 0.18)
+    friction_range: tuple[float, float] = (0.20, 1.20)
+    safe_force_range: tuple[float, float] = (0.40, 2.80)
+    offset_range: tuple[float, float] = (-0.006, 0.006)
+    nominal_pad_force_capacity: float = 0.70
+    holding_force_margin: float = 0.80
+    safe_force_margin: float = 1.35
 
 
 class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
@@ -62,6 +71,9 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
     metadata = {"render_modes": ["rgb_array", "human"], "render_fps": 25}
 
     ACTION_NAMES = ("palm_lift", "finger_1_close", "finger_2_close", "finger_3_close")
+    OBJECT_SHAPES = ("cylinder", "box", "capsule", "ellipsoid")
+    TRAINING_SHAPES = ("cylinder", "box", "capsule")
+    GRASP_PAIR_NAMES = tuple(f"finger_{finger}_object_contact" for finger in range(1, 4))
     TAXEL_NAMES = tuple(
         f"finger_{finger}_taxel_r{row}_c{column}_force"
         for finger in range(1, 4)
@@ -114,6 +126,11 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             raise ValueError("exploration_steps must be smaller than max_episode_steps")
         if self.config.physics_steps_per_action < 1:
             raise ValueError("physics_steps_per_action must be positive")
+        unknown_shapes = set(self.config.training_shapes) - set(self.OBJECT_SHAPES)
+        if unknown_shapes:
+            raise ValueError(f"Unsupported training shapes: {sorted(unknown_shapes)}")
+        if not self.config.training_shapes:
+            raise ValueError("training_shapes must contain at least one shape")
 
         self.render_mode = render_mode
         self._width = width
@@ -127,6 +144,9 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
 
         self._object_body_id = self.model.body("object").id
         self._object_geom_id = self.model.geom("object_geom").id
+        self._grasp_pair_ids = np.array(
+            [self.model.pair(name).id for name in self.GRASP_PAIR_NAMES], dtype=np.int32
+        )
         self._object_joint_id = self.model.joint("object_free").id
         self._object_qpos_adr = int(self.model.jnt_qposadr[self._object_joint_id])
         self._palm_qpos_adr = int(self.model.jnt_qposadr[self.model.joint("palm_lift").id])
@@ -156,6 +176,8 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._peak_pad_force = 0.0
         self._rest_object_height = 0.0
         self._previous_lift_height = 0.0
+        self._previous_object_xy = np.zeros(2, dtype=np.float64)
+        self._cumulative_slip_distance = 0.0
         self._previous_action = np.zeros(4, dtype=np.float32)
         self._control_targets = self._ctrl_low.copy()
         self._outcome: str | None = None
@@ -184,6 +206,8 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._peak_pad_force = 0.0
         self._rest_object_height = self._object_height()
         self._previous_lift_height = 0.0
+        self._previous_object_xy = self.data.xpos[self._object_body_id, :2].copy()
+        self._cumulative_slip_distance = 0.0
         self._previous_action.fill(0.0)
         self._control_targets = self._ctrl_low.copy()
         self._outcome = None
@@ -233,11 +257,21 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._peak_pad_force = max(self._peak_pad_force, max_force)
         lift_height = self._lift_height()
         object_falling = lift_height < self._previous_lift_height - 0.001
+        object_xy = self.data.xpos[self._object_body_id, :2].copy()
+        lateral_distance = float(np.linalg.norm(object_xy - self._previous_object_xy))
         contacting = int(np.count_nonzero(pad_forces > self.config.contact_force_threshold))
         palm_has_lifted = self.data.qpos[self._palm_qpos_adr] > self.config.attempted_lift_height
-        slipped = bool(lift_allowed and palm_has_lifted and object_falling and contacting < 2)
+        slipped = bool(
+            lift_allowed
+            and palm_has_lifted
+            and (
+                (object_falling and contacting < 2)
+                or lateral_distance > self.config.slip_distance_threshold
+            )
+        )
         if slipped:
             self._slip_events += 1
+            self._cumulative_slip_distance += lateral_distance
 
         damaged = max_force > self.object_params.safe_force
         dropped = bool(
@@ -246,9 +280,16 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             and contacting < 2
             and lift_height < 0.004
         )
+        tilt = self._object_tilt()
+        unstable = bool(
+            lift_allowed
+            and palm_has_lifted
+            and lift_height > 0.004
+            and tilt > self.config.max_tilt_radians
+        )
         at_target = lift_height >= self.config.lift_target_height and contacting >= 2
         self._successful_hold_steps = self._successful_hold_steps + 1 if at_target else 0
-        succeeded = self._successful_hold_steps >= self.config.success_hold_steps
+        succeeded = self._successful_hold_steps >= self.config.success_hold_steps and not unstable
 
         reward = self._reward(
             action=policy_action,
@@ -257,6 +298,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             slipped=slipped,
             damaged=damaged,
             dropped=dropped,
+            unstable=unstable,
             succeeded=succeeded,
             lift_allowed=lift_allowed,
         )
@@ -264,15 +306,18 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             self._outcome = "damage"
         elif succeeded:
             self._outcome = "success"
+        elif unstable:
+            self._outcome = "unstable"
         elif dropped:
             self._outcome = "drop"
 
-        terminated = bool(damaged or succeeded or dropped)
+        terminated = bool(damaged or succeeded or unstable or dropped)
         truncated = bool(not terminated and self._step_count >= self.config.max_episode_steps)
         if truncated:
             self._outcome = "timeout"
 
         self._previous_lift_height = lift_height
+        self._previous_object_xy = object_xy
         observation = self._observation()
         info = self._info()
         if self.render_mode == "human":
@@ -313,34 +358,89 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         def sampled(name: str, limits: tuple[float, float]) -> float:
             return float(provided[name]) if name in provided else float(self.np_random.uniform(*limits))
 
+        shape = str(
+            provided.get("shape", self.np_random.choice(self.config.training_shapes))
+        )
+        if shape not in self.OBJECT_SHAPES:
+            raise ValueError(f"Unsupported object shape: {shape!r}")
+        if shape == "capsule":
+            half_size_x = sampled("half_size_x", self.config.capsule_radius_range)
+            half_size_y = float(provided.get("half_size_y", half_size_x))
+            minimum_height = half_size_x + 0.004
+            if "half_size_z" in provided:
+                half_size_z = float(provided["half_size_z"])
+            else:
+                half_size_z = float(
+                    self.np_random.uniform(
+                        max(self.config.half_height_range[0], minimum_height),
+                        self.config.half_height_range[1],
+                    )
+                )
+        elif shape == "cylinder":
+            half_size_x = sampled("half_size_x", self.config.radial_size_range)
+            half_size_y = float(provided.get("half_size_y", half_size_x))
+            half_size_z = sampled("half_size_z", self.config.half_height_range)
+        else:
+            half_size_x = sampled("half_size_x", self.config.radial_size_range)
+            half_size_y = sampled("half_size_y", self.config.radial_size_range)
+            half_size_z = sampled("half_size_z", self.config.half_height_range)
+
+        friction = sampled("friction", self.config.friction_range)
+        if "mass" in provided:
+            mass = float(provided["mass"])
+        else:
+            feasible_mass_ceiling = (
+                3.0
+                * friction
+                * self.config.nominal_pad_force_capacity
+                * self.config.holding_force_margin
+                / 9.81
+            )
+            upper_mass = max(
+                self.config.mass_range[0],
+                min(self.config.mass_range[1], feasible_mass_ceiling),
+            )
+            mass = float(self.np_random.uniform(self.config.mass_range[0], upper_mass))
+        required_pad_force = mass * 9.81 / (3.0 * friction)
+        if "safe_force" in provided:
+            safe_force = float(provided["safe_force"])
+        else:
+            lower_safe_force = max(
+                self.config.safe_force_range[0],
+                required_pad_force * self.config.safe_force_margin,
+            )
+            upper_safe_force = max(lower_safe_force, self.config.safe_force_range[1])
+            safe_force = float(self.np_random.uniform(lower_safe_force, upper_safe_force))
+
         return ObjectParams(
-            radius=sampled("radius", self.config.radius_range),
-            half_height=sampled("half_height", self.config.half_height_range),
-            mass=sampled("mass", self.config.mass_range),
-            friction=sampled("friction", self.config.friction_range),
-            safe_force=sampled("safe_force", self.config.safe_force_range),
+            shape=shape,
+            half_size_x=half_size_x,
+            half_size_y=half_size_y,
+            half_size_z=half_size_z,
+            mass=mass,
+            friction=friction,
+            safe_force=safe_force,
             x_offset=sampled("x_offset", self.config.offset_range),
             y_offset=sampled("y_offset", self.config.offset_range),
             yaw=sampled("yaw", (-np.pi, np.pi)),
         )
 
     def _apply_object_params(self, params: ObjectParams) -> None:
-        if params.radius <= 0 or params.half_height <= 0 or params.mass <= 0:
-            raise ValueError("Object radius, height, and mass must be positive")
+        if min(params.half_size_x, params.half_size_y, params.half_size_z, params.mass) <= 0:
+            raise ValueError("Object dimensions and mass must be positive")
         if params.friction <= 0 or params.safe_force <= 0:
             raise ValueError("Object friction and safe_force must be positive")
+        if params.shape == "capsule" and params.half_size_z <= params.half_size_x:
+            raise ValueError("Capsule half_size_z must exceed its radius")
 
-        self.model.geom_size[self._object_geom_id, :2] = (params.radius, params.half_height)
+        self.model.geom_type[self._object_geom_id] = self._geom_type(params.shape)
+        self.model.geom_size[self._object_geom_id] = self._geom_size(params)
+        self.model.geom_rbound[self._object_geom_id] = self._geom_rbound(params)
         self.model.geom_friction[self._object_geom_id, 0] = params.friction
+        for pair_id in self._grasp_pair_ids:
+            self.model.pair_friction[pair_id, :2] = params.friction
         self.model.body_mass[self._object_body_id] = params.mass
-        full_height = 2.0 * params.half_height
-        transverse_inertia = params.mass * (3.0 * params.radius**2 + full_height**2) / 12.0
-        axial_inertia = 0.5 * params.mass * params.radius**2
-        self.model.body_inertia[self._object_body_id] = (
-            transverse_inertia,
-            transverse_inertia,
-            axial_inertia,
-        )
+        self.model.body_inertia[self._object_body_id] = self._body_inertia(params)
 
     def _place_object(self, params: ObjectParams) -> None:
         half_yaw = 0.5 * params.yaw
@@ -348,12 +448,67 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         qpos[:] = (
             params.x_offset,
             params.y_offset,
-            params.half_height + 0.001,
+            params.half_size_z + 0.001,
             np.cos(half_yaw),
             0.0,
             0.0,
             np.sin(half_yaw),
         )
+
+    @staticmethod
+    def _geom_type(shape: str) -> int:
+        return {
+            "cylinder": int(mujoco.mjtGeom.mjGEOM_CYLINDER),
+            "box": int(mujoco.mjtGeom.mjGEOM_BOX),
+            "capsule": int(mujoco.mjtGeom.mjGEOM_CAPSULE),
+            "ellipsoid": int(mujoco.mjtGeom.mjGEOM_ELLIPSOID),
+        }[shape]
+
+    @staticmethod
+    def _geom_size(params: ObjectParams) -> NDArray[np.float64]:
+        if params.shape == "cylinder":
+            return np.array([params.half_size_x, params.half_size_z, 0.0])
+        if params.shape == "capsule":
+            cylinder_half_length = params.half_size_z - params.half_size_x
+            return np.array([params.half_size_x, cylinder_half_length, 0.0])
+        return np.array([params.half_size_x, params.half_size_y, params.half_size_z])
+
+    @staticmethod
+    def _geom_rbound(params: ObjectParams) -> float:
+        if params.shape == "cylinder":
+            return float(np.hypot(params.half_size_x, params.half_size_z))
+        if params.shape == "capsule":
+            return params.half_size_z
+        if params.shape == "ellipsoid":
+            return max(params.half_size_x, params.half_size_y, params.half_size_z)
+        return float(np.linalg.norm([params.half_size_x, params.half_size_y, params.half_size_z]))
+
+    @staticmethod
+    def _body_inertia(params: ObjectParams) -> tuple[float, float, float]:
+        mass = params.mass
+        x, y, z = params.half_size_x, params.half_size_y, params.half_size_z
+        if params.shape == "box":
+            return (mass * (y**2 + z**2) / 3.0, mass * (x**2 + z**2) / 3.0, mass * (x**2 + y**2) / 3.0)
+        if params.shape == "ellipsoid":
+            return (mass * (y**2 + z**2) / 5.0, mass * (x**2 + z**2) / 5.0, mass * (x**2 + y**2) / 5.0)
+        if params.shape == "cylinder":
+            transverse = mass * (3.0 * x**2 + (2.0 * z) ** 2) / 12.0
+            axial = 0.5 * mass * x**2
+            return (transverse, transverse, axial)
+
+        cylinder_half_length = z - x
+        cylinder_volume = np.pi * x**2 * (2.0 * cylinder_half_length)
+        cap_volume = 4.0 * np.pi * x**3 / 3.0
+        cylinder_mass = mass * cylinder_volume / (cylinder_volume + cap_volume)
+        cap_mass = mass - cylinder_mass
+        transverse = cylinder_mass * (
+            3.0 * x**2 + (2.0 * cylinder_half_length) ** 2
+        ) / 12.0
+        transverse += cap_mass * (
+            0.4 * x**2 + cylinder_half_length**2 + 0.75 * cylinder_half_length * x
+        )
+        axial = 0.5 * cylinder_mass * x**2 + 0.4 * cap_mass * x**2
+        return (transverse, transverse, axial)
 
     def _reward(
         self,
@@ -364,6 +519,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         slipped: bool,
         damaged: bool,
         dropped: bool,
+        unstable: bool,
         succeeded: bool,
         lift_allowed: bool,
     ) -> float:
@@ -378,6 +534,8 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             reward -= 0.25
         if damaged:
             reward -= 10.0
+        elif unstable:
+            reward -= 5.0
         elif dropped:
             reward -= 5.0
         elif succeeded:
@@ -416,10 +574,12 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             "object_params": params,
             "object_height": self._object_height(),
             "lift_height": self._lift_height(),
+            "tilt_radians": self._object_tilt(),
             "control_targets": self._control_targets.copy(),
             "pad_forces": pad_forces.copy(),
             "peak_pad_force": self._peak_pad_force,
             "slip_events": self._slip_events,
+            "cumulative_slip_distance": self._cumulative_slip_distance,
         }
 
     def _read_many(self, names: tuple[str, ...]) -> FloatArray:
@@ -433,6 +593,10 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
 
     def _lift_height(self) -> float:
         return max(0.0, self._object_height() - self._rest_object_height)
+
+    def _object_tilt(self) -> float:
+        upright_z = float(self.data.xmat[self._object_body_id].reshape(3, 3)[2, 2])
+        return float(np.arccos(np.clip(upright_z, -1.0, 1.0)))
 
 
 __all__ = ["BlindTouchEnv", "EnvConfig", "ObjectParams"]
