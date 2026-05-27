@@ -1,6 +1,38 @@
 todo.txt
+
+# Virtual environments and local configuration
 .venv/
-log.txt
+.env
+.env.local
+.envrc
+
+# Python caches and test output
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Packaging/build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local logs and notes
+log.txt
+*.log
+
+# Generated BlindTouch artifacts
+scratch/
+renders/
+reports/
+runs/
+checkpoints/
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/
