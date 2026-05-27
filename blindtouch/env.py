@@ -14,24 +14,16 @@ import mujoco
 import numpy as np
 from numpy.typing import NDArray
 
+from .objects import (
+    EpisodeObject,
+    SamplingConfig,
+    episode_object_from_mapping,
+    get_demo_object,
+    sample_training_object,
+)
+
 
 FloatArray = NDArray[np.float32]
-
-
-@dataclass(frozen=True)
-class ObjectParams:
-    """Hidden physical properties for one rigid primitive object episode."""
-
-    shape: str
-    half_size_x: float
-    half_size_y: float
-    half_size_z: float
-    mass: float
-    friction: float
-    safe_force: float
-    x_offset: float
-    y_offset: float
-    yaw: float
 
 
 @dataclass(frozen=True)
@@ -52,17 +44,12 @@ class EnvConfig:
     velocity_scale: float = 0.5
     max_tilt_radians: float = np.deg2rad(40.0)
     slip_distance_threshold: float = 0.0005
-    training_shapes: tuple[str, ...] = ("cylinder", "box", "capsule")
-    radial_size_range: tuple[float, float] = (0.023, 0.031)
-    capsule_radius_range: tuple[float, float] = (0.023, 0.028)
-    half_height_range: tuple[float, float] = (0.022, 0.040)
-    mass_range: tuple[float, float] = (0.03, 0.18)
-    friction_range: tuple[float, float] = (0.20, 1.20)
-    safe_force_range: tuple[float, float] = (0.40, 2.80)
-    offset_range: tuple[float, float] = (-0.006, 0.006)
-    nominal_pad_force_capacity: float = 0.70
-    holding_force_margin: float = 0.80
-    safe_force_margin: float = 1.35
+    reset_clearance: float = 0.001
+    maximum_settle_xy_displacement: float = 0.002
+    max_reset_attempts: int = 10
+    pad_center_height: float = 0.040
+    pad_half_height: float = 0.027
+    palm_static_sag_compensation: float = 0.008
 
 
 class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
@@ -71,8 +58,6 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
     metadata = {"render_modes": ["rgb_array", "human"], "render_fps": 25}
 
     ACTION_NAMES = ("palm_lift", "finger_1_close", "finger_2_close", "finger_3_close")
-    OBJECT_SHAPES = ("cylinder", "box", "capsule", "ellipsoid")
-    TRAINING_SHAPES = ("cylinder", "box", "capsule")
     GRASP_PAIR_NAMES = tuple(f"finger_{finger}_object_contact" for finger in range(1, 4))
     TAXEL_NAMES = tuple(
         f"finger_{finger}_taxel_r{row}_c{column}_force"
@@ -113,7 +98,9 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         *,
         xml_path: str | Path | None = None,
         config: EnvConfig | None = None,
+        sampling_config: SamplingConfig | None = None,
         render_mode: str | None = None,
+        camera_name: str = "overview",
         width: int = 640,
         height: int = 480,
     ) -> None:
@@ -122,15 +109,15 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             raise ValueError(f"Unsupported render mode: {render_mode!r}")
 
         self.config = config or EnvConfig()
+        self.sampling_config = sampling_config or SamplingConfig()
         if self.config.exploration_steps >= self.config.max_episode_steps:
             raise ValueError("exploration_steps must be smaller than max_episode_steps")
         if self.config.physics_steps_per_action < 1:
             raise ValueError("physics_steps_per_action must be positive")
-        unknown_shapes = set(self.config.training_shapes) - set(self.OBJECT_SHAPES)
-        if unknown_shapes:
-            raise ValueError(f"Unsupported training shapes: {sorted(unknown_shapes)}")
-        if not self.config.training_shapes:
-            raise ValueError("training_shapes must contain at least one shape")
+        if self.config.max_reset_attempts < 1:
+            raise ValueError("max_reset_attempts must be positive")
+        if not self.sampling_config.training_families:
+            raise ValueError("training_families must contain at least one family")
 
         self.render_mode = render_mode
         self._width = width
@@ -141,9 +128,71 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         asset_path = Path(xml_path) if xml_path else Path(__file__).with_name("assets") / "claw.xml"
         self.model = mujoco.MjModel.from_xml_path(str(asset_path))
         self.data = mujoco.MjData(self.model)
+        try:
+            self.model.camera(camera_name)
+        except KeyError as error:
+            raise ValueError(f"Unsupported camera: {camera_name!r}") from error
+        self._camera_name = camera_name
 
         self._object_body_id = self.model.body("object").id
         self._object_geom_id = self.model.geom("object_geom").id
+        self._compound_geom_ids = {
+            name: self.model.geom(name).id
+            for name in (
+                "object_cabin_geom",
+                "object_wheel_fl_geom",
+                "object_wheel_fr_geom",
+                "object_wheel_rl_geom",
+                "object_wheel_rr_geom",
+            )
+        }
+        self._accent_geom_ids = tuple(
+            self.model.geom(name).id
+            for name in (
+                "object_accent_1_geom",
+                "object_accent_2_geom",
+                "object_accent_3_geom",
+                "object_accent_4_geom",
+                "object_accent_5_geom",
+                "object_accent_6_geom",
+                "object_accent_7_geom",
+                "object_accent_8_geom",
+                "object_accent_9_geom",
+                "object_accent_10_geom",
+            )
+        )
+        self._mutable_object_geom_ids = (
+            self._object_geom_id,
+            *self._compound_geom_ids.values(),
+            *self._accent_geom_ids,
+        )
+        for geom_id in self._mutable_object_geom_ids:
+            # MuJoCo optimizes XML geoms at identity as body-frame geoms. These
+            # placeholders are repositioned at reset time, so keep their local
+            # transforms active.
+            self.model.geom_sameframe[geom_id] = int(mujoco.mjtSameFrame.mjSAMEFRAME_NONE)
+        self._material_ids = {
+            name: self.model.material(name).id
+            for name in (
+                "object",
+                "orange_skin",
+                "fruit_leaf",
+                "tomato_skin",
+                "soap_body",
+                "soap_stamp",
+                "car_body",
+                "car_window",
+                "car_tire",
+                "car_lamp",
+                "car_tail_lamp",
+                "car_racing_stripe",
+                "car_hubcap",
+            )
+        }
+        self._pad_geom_ids = np.array(
+            [self.model.geom(f"finger_{finger}_pad").id for finger in range(1, 4)],
+            dtype=np.int32,
+        )
         self._grasp_pair_ids = np.array(
             [self.model.pair(name).id for name in self.GRASP_PAIR_NAMES], dtype=np.int32
         )
@@ -169,7 +218,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self.action_space = spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32)
         self.observation_space = spaces.Box(-1.0, 1.0, shape=(45,), dtype=np.float32)
 
-        self.object_params: ObjectParams | None = None
+        self.object_params: EpisodeObject | None = None
         self._step_count = 0
         self._successful_hold_steps = 0
         self._slip_events = 0
@@ -177,10 +226,16 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._rest_object_height = 0.0
         self._previous_lift_height = 0.0
         self._previous_object_xy = np.zeros(2, dtype=np.float64)
+        self._rest_object_orientation = np.eye(3, dtype=np.float64)
         self._cumulative_slip_distance = 0.0
         self._previous_action = np.zeros(4, dtype=np.float32)
         self._control_targets = self._ctrl_low.copy()
         self._outcome: str | None = None
+        self._initial_palm_height = 0.0
+        self._initial_penetration = False
+        self._settle_xy_displacement = 0.0
+        self._reset_valid = True
+        self._rejected_reset_samples = 0
 
     def reset(
         self,
@@ -191,14 +246,38 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         """Reset into an open-claw episode with a newly hidden object."""
 
         super().reset(seed=seed)
-        mujoco.mj_resetData(self.model, self.data)
-        self.object_params = self._choose_object_params(options or {})
-        self._apply_object_params(self.object_params)
-        self._place_object(self.object_params)
-        self.data.ctrl[:] = self._ctrl_low
-        mujoco.mj_forward(self.model, self.data)
-        for _ in range(self.config.settle_steps):
-            mujoco.mj_step(self.model, self.data)
+        episode_options = options or {}
+        randomized_reset = not any(
+            key in episode_options for key in ("object", "object_params", "demo_object")
+        )
+        self._rejected_reset_samples = 0
+        for _ in range(self.config.max_reset_attempts):
+            mujoco.mj_resetData(self.model, self.data)
+            self.object_params = self._choose_object(episode_options)
+            self._apply_object_params(self.object_params)
+            self._place_object(self.object_params)
+            self._control_targets = self._ctrl_low.copy()
+            self._control_targets[0] = self._palm_target_for_grasp_band(self.object_params)
+            self.data.qpos[self._palm_qpos_adr] = self._control_targets[0]
+            self.data.ctrl[:] = self._control_targets
+            mujoco.mj_forward(self.model, self.data)
+            self._initial_penetration = self._has_initial_penetration()
+            initial_object_xy = self.data.xpos[self._object_body_id, :2].copy()
+            for _ in range(self.config.settle_steps):
+                mujoco.mj_step(self.model, self.data)
+            self._settle_xy_displacement = float(
+                np.linalg.norm(self.data.xpos[self._object_body_id, :2] - initial_object_xy)
+            )
+            self._reset_valid = (
+                not self._initial_penetration
+                and self._settle_xy_displacement <= self.config.maximum_settle_xy_displacement
+                and self._grasp_band_is_reachable(self.object_params)
+            )
+            if self._reset_valid or not randomized_reset:
+                break
+            self._rejected_reset_samples += 1
+        else:
+            raise RuntimeError("Unable to sample a valid object reset after maximum attempts")
 
         self._step_count = 0
         self._successful_hold_steps = 0
@@ -207,9 +286,10 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._rest_object_height = self._object_height()
         self._previous_lift_height = 0.0
         self._previous_object_xy = self.data.xpos[self._object_body_id, :2].copy()
+        self._rest_object_orientation = self.data.xmat[self._object_body_id].reshape(3, 3).copy()
         self._cumulative_slip_distance = 0.0
         self._previous_action.fill(0.0)
-        self._control_targets = self._ctrl_low.copy()
+        self._initial_palm_height = float(self.data.qpos[self._palm_qpos_adr])
         self._outcome = None
 
         observation = self._observation()
@@ -260,7 +340,10 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         object_xy = self.data.xpos[self._object_body_id, :2].copy()
         lateral_distance = float(np.linalg.norm(object_xy - self._previous_object_xy))
         contacting = int(np.count_nonzero(pad_forces > self.config.contact_force_threshold))
-        palm_has_lifted = self.data.qpos[self._palm_qpos_adr] > self.config.attempted_lift_height
+        palm_has_lifted = (
+            self.data.qpos[self._palm_qpos_adr] - self._initial_palm_height
+            > self.config.attempted_lift_height
+        )
         slipped = bool(
             lift_allowed
             and palm_has_lifted
@@ -330,7 +413,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         if self.render_mode == "rgb_array":
             if self._renderer is None:
                 self._renderer = mujoco.Renderer(self.model, height=self._height, width=self._width)
-            self._renderer.update_scene(self.data, camera="overview")
+            self._renderer.update_scene(self.data, camera=self._camera_name)
             return self._renderer.render()
         if self.render_mode == "human":
             if self._viewer is None:
@@ -348,84 +431,22 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             self._viewer.close()
             self._viewer = None
 
-    def _choose_object_params(self, options: Mapping[str, Any]) -> ObjectParams:
-        provided = options.get("object_params", {})
-        if provided is None:
-            provided = {}
-        if not isinstance(provided, Mapping):
-            raise TypeError("options['object_params'] must be a mapping")
+    def _choose_object(self, options: Mapping[str, Any]) -> EpisodeObject:
+        provided_object = options.get("object")
+        if provided_object is not None:
+            if not isinstance(provided_object, EpisodeObject):
+                raise TypeError("options['object'] must be an EpisodeObject")
+            return provided_object
+        if "demo_object" in options:
+            return get_demo_object(str(options["demo_object"]), options.get("pose"))
+        if "object_params" in options:
+            provided_params = options["object_params"]
+            if not isinstance(provided_params, Mapping):
+                raise TypeError("options['object_params'] must be a mapping")
+            return episode_object_from_mapping(provided_params)
+        return sample_training_object(self.np_random, self.sampling_config)
 
-        def sampled(name: str, limits: tuple[float, float]) -> float:
-            return float(provided[name]) if name in provided else float(self.np_random.uniform(*limits))
-
-        shape = str(
-            provided.get("shape", self.np_random.choice(self.config.training_shapes))
-        )
-        if shape not in self.OBJECT_SHAPES:
-            raise ValueError(f"Unsupported object shape: {shape!r}")
-        if shape == "capsule":
-            half_size_x = sampled("half_size_x", self.config.capsule_radius_range)
-            half_size_y = float(provided.get("half_size_y", half_size_x))
-            minimum_height = half_size_x + 0.004
-            if "half_size_z" in provided:
-                half_size_z = float(provided["half_size_z"])
-            else:
-                half_size_z = float(
-                    self.np_random.uniform(
-                        max(self.config.half_height_range[0], minimum_height),
-                        self.config.half_height_range[1],
-                    )
-                )
-        elif shape == "cylinder":
-            half_size_x = sampled("half_size_x", self.config.radial_size_range)
-            half_size_y = float(provided.get("half_size_y", half_size_x))
-            half_size_z = sampled("half_size_z", self.config.half_height_range)
-        else:
-            half_size_x = sampled("half_size_x", self.config.radial_size_range)
-            half_size_y = sampled("half_size_y", self.config.radial_size_range)
-            half_size_z = sampled("half_size_z", self.config.half_height_range)
-
-        friction = sampled("friction", self.config.friction_range)
-        if "mass" in provided:
-            mass = float(provided["mass"])
-        else:
-            feasible_mass_ceiling = (
-                3.0
-                * friction
-                * self.config.nominal_pad_force_capacity
-                * self.config.holding_force_margin
-                / 9.81
-            )
-            upper_mass = max(
-                self.config.mass_range[0],
-                min(self.config.mass_range[1], feasible_mass_ceiling),
-            )
-            mass = float(self.np_random.uniform(self.config.mass_range[0], upper_mass))
-        required_pad_force = mass * 9.81 / (3.0 * friction)
-        if "safe_force" in provided:
-            safe_force = float(provided["safe_force"])
-        else:
-            lower_safe_force = max(
-                self.config.safe_force_range[0],
-                required_pad_force * self.config.safe_force_margin,
-            )
-            upper_safe_force = max(lower_safe_force, self.config.safe_force_range[1])
-            safe_force = float(self.np_random.uniform(lower_safe_force, upper_safe_force))
-
-        return ObjectParams(
-            shape=shape,
-            half_size_x=half_size_x,
-            half_size_y=half_size_y,
-            half_size_z=half_size_z,
-            mass=mass,
-            friction=friction,
-            safe_force=safe_force,
-            x_offset=sampled("x_offset", self.config.offset_range),
-            y_offset=sampled("y_offset", self.config.offset_range),
-            yaw=sampled("yaw", (-np.pi, np.pi)),
-        )
-
-    def _apply_object_params(self, params: ObjectParams) -> None:
+    def _apply_object_params(self, params: EpisodeObject) -> None:
         if min(params.half_size_x, params.half_size_y, params.half_size_z, params.mass) <= 0:
             raise ValueError("Object dimensions and mass must be positive")
         if params.friction <= 0 or params.safe_force <= 0:
@@ -437,23 +458,277 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self.model.geom_size[self._object_geom_id] = self._geom_size(params)
         self.model.geom_rbound[self._object_geom_id] = self._geom_rbound(params)
         self.model.geom_friction[self._object_geom_id, 0] = params.friction
+        for pad_id in self._pad_geom_ids:
+            self.model.geom_friction[pad_id, :2] = params.friction
         for pair_id in self._grasp_pair_ids:
             self.model.pair_friction[pair_id, :2] = params.friction
+        self._configure_compound_geometry(params)
+        self._configure_visual_geometry(params)
         self.model.body_mass[self._object_body_id] = params.mass
         self.model.body_inertia[self._object_body_id] = self._body_inertia(params)
 
-    def _place_object(self, params: ObjectParams) -> None:
-        half_yaw = 0.5 * params.yaw
+    def _place_object(self, params: EpisodeObject) -> None:
         qpos = self.data.qpos[self._object_qpos_adr : self._object_qpos_adr + 7]
         qpos[:] = (
             params.x_offset,
             params.y_offset,
-            params.half_size_z + 0.001,
-            np.cos(half_yaw),
-            0.0,
-            0.0,
-            np.sin(half_yaw),
+            params.resting_half_height + self.config.reset_clearance,
+            *params.quaternion,
         )
+
+    def _palm_target_for_grasp_band(self, params: EpisodeObject) -> float:
+        lowest_collision_clear_center = self.config.pad_half_height + self.config.reset_clearance
+        requested_center = max(params.grasp_height, lowest_collision_clear_center)
+        requested = (
+            requested_center
+            - self.config.pad_center_height
+            + self.config.palm_static_sag_compensation
+        )
+        return float(np.clip(requested, self._ctrl_low[0], self._ctrl_high[0]))
+
+    def _grasp_band_is_reachable(self, params: EpisodeObject) -> bool:
+        pad_center = self.config.pad_center_height + self._control_targets[0]
+        return bool(
+            pad_center - self.config.pad_half_height
+            <= params.grasp_height
+            <= pad_center + self.config.pad_half_height
+        )
+
+    def _has_initial_penetration(self) -> bool:
+        contact_object_ids = {self._object_geom_id, *self._compound_geom_ids.values()}
+        for contact in self.data.contact[: self.data.ncon]:
+            geom_ids = {contact.geom1, contact.geom2}
+            names = {self.model.geom(geom_id).name for geom_id in geom_ids}
+            if geom_ids & contact_object_ids and "table" not in names:
+                return True
+        return False
+
+    def _configure_compound_geometry(self, params: EpisodeObject) -> None:
+        self.model.geom_pos[self._object_geom_id] = (0.0, 0.0, 0.0)
+        for pad_id in self._pad_geom_ids:
+            self.model.geom_conaffinity[pad_id] = 0
+        for geom_id in self._compound_geom_ids.values():
+            self.model.geom_contype[geom_id] = 0
+            self.model.geom_conaffinity[geom_id] = 0
+            self.model.geom_matid[geom_id] = -1
+            self.model.geom_rgba[geom_id] = (0.0, 0.0, 0.0, 0.0)
+        if params.shape != "chassis":
+            return
+
+        x, y, z = params.half_size_x, params.half_size_y, params.half_size_z
+        wheel_radius = min(0.0065, 0.40 * z)
+        base_half_height = max(0.0045, 0.38 * z)
+        base_height = -z + 2.0 * wheel_radius + base_half_height
+        cabin_half_height = max(0.003, 0.22 * z)
+        cabin_height = z - cabin_half_height
+        wheel_x = x - 1.25 * wheel_radius
+        wheel_y = y - 0.75 * wheel_radius
+        wheel_height = -z + wheel_radius
+
+        self.model.geom_size[self._object_geom_id] = (
+            0.88 * x,
+            0.78 * y,
+            base_half_height,
+        )
+        self.model.geom_pos[self._object_geom_id] = (0.0, 0.0, base_height)
+        self.model.geom_rbound[self._object_geom_id] = float(
+            np.linalg.norm(self.model.geom_size[self._object_geom_id])
+        )
+
+        cabin_id = self._compound_geom_ids["object_cabin_geom"]
+        self.model.geom_size[cabin_id] = (0.48 * x, 0.68 * y, cabin_half_height)
+        self.model.geom_pos[cabin_id] = (0.0, 0.0, cabin_height)
+        self.model.geom_rbound[cabin_id] = float(np.linalg.norm(self.model.geom_size[cabin_id]))
+        wheel_positions = {
+            "object_wheel_fl_geom": (wheel_x, wheel_y, wheel_height),
+            "object_wheel_fr_geom": (wheel_x, -wheel_y, wheel_height),
+            "object_wheel_rl_geom": (-wheel_x, wheel_y, wheel_height),
+            "object_wheel_rr_geom": (-wheel_x, -wheel_y, wheel_height),
+        }
+        for name, position in wheel_positions.items():
+            wheel_id = self._compound_geom_ids[name]
+            self.model.geom_size[wheel_id, 0] = wheel_radius
+            self.model.geom_pos[wheel_id] = position
+            self.model.geom_rbound[wheel_id] = wheel_radius
+
+        self.model.geom_rgba[cabin_id] = (0.18, 0.35, 0.78, 1.0)
+        for name, geom_id in self._compound_geom_ids.items():
+            self.model.geom_contype[geom_id] = 4
+            self.model.geom_conaffinity[geom_id] = 1
+            self.model.geom_friction[geom_id, :2] = params.friction
+            if name != "object_cabin_geom":
+                self.model.geom_rgba[geom_id] = (0.08, 0.08, 0.10, 1.0)
+        for pad_id in self._pad_geom_ids:
+            self.model.geom_conaffinity[pad_id] = 4
+
+    def _configure_visual_geometry(self, params: EpisodeObject) -> None:
+        self._show_material(self._object_geom_id, "object")
+        for geom_id in self._accent_geom_ids:
+            self.model.geom_matid[geom_id] = -1
+            self.model.geom_rgba[geom_id] = (0.0, 0.0, 0.0, 0.0)
+            self.model.geom_pos[geom_id] = (0.0, 0.0, 0.0)
+            self.model.geom_quat[geom_id] = (1.0, 0.0, 0.0, 0.0)
+
+        if params.visual_style == "orange":
+            self._show_material(self._object_geom_id, "orange_skin")
+            self._set_accent(
+                0,
+                geom_type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+                size=(0.002, 0.004, 0.0),
+                position=(0.0, 0.0, params.half_size_z + 0.003),
+                material="fruit_leaf",
+            )
+            self._set_accent(
+                1,
+                geom_type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
+                size=(0.006, 0.003, 0.001),
+                position=(0.004, 0.0, params.half_size_z + 0.005),
+                material="fruit_leaf",
+            )
+        elif params.visual_style == "tomato":
+            self._show_material(self._object_geom_id, "tomato_skin")
+            self._set_accent(
+                0,
+                geom_type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+                size=(0.0015, 0.003, 0.0),
+                position=(0.0, 0.0, params.half_size_z + 0.002),
+                material="fruit_leaf",
+            )
+            self._set_accent(
+                1,
+                geom_type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
+                size=(0.009, 0.0035, 0.001),
+                position=(0.002, 0.0, params.half_size_z + 0.002),
+                material="fruit_leaf",
+            )
+        elif params.visual_style == "soap_bar":
+            self.model.geom_matid[self._object_geom_id] = -1
+            self.model.geom_rgba[self._object_geom_id] = (0.0, 0.0, 0.0, 0.0)
+            self._set_accent(
+                0,
+                geom_type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
+                size=(params.half_size_x, params.half_size_y, params.half_size_z),
+                position=(0.0, 0.0, 0.0),
+                material="soap_body",
+            )
+            self._set_accent(
+                1,
+                geom_type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
+                size=(0.012, 0.007, 0.0008),
+                position=(0.0, 0.0, params.half_size_z + 0.0007),
+                material="soap_stamp",
+            )
+        elif params.visual_style == "toy_car":
+            self._show_material(self._object_geom_id, "car_body")
+            self._show_material(self._compound_geom_ids["object_cabin_geom"], "car_window")
+            for name in (
+                "object_wheel_fl_geom",
+                "object_wheel_fr_geom",
+                "object_wheel_rl_geom",
+                "object_wheel_rr_geom",
+            ):
+                self._show_material(self._compound_geom_ids[name], "car_tire")
+            body_top_z = (
+                self.model.geom_pos[self._object_geom_id, 2]
+                + self.model.geom_size[self._object_geom_id, 2]
+            )
+            cabin_top_z = (
+                self.model.geom_pos[self._compound_geom_ids["object_cabin_geom"], 2]
+                + self.model.geom_size[self._compound_geom_ids["object_cabin_geom"], 2]
+            )
+            lamp_z = body_top_z - 0.002
+            self._set_accent(
+                0,
+                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=(0.0015, 0.0045, 0.0020),
+                position=(params.half_size_x * 0.86, params.half_size_y * 0.42, lamp_z),
+                material="car_lamp",
+            )
+            self._set_accent(
+                1,
+                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=(0.0015, 0.0045, 0.0020),
+                position=(params.half_size_x * 0.86, -params.half_size_y * 0.42, lamp_z),
+                material="car_lamp",
+            )
+            self._set_accent(
+                2,
+                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=(0.0013, 0.0038, 0.0018),
+                position=(-params.half_size_x * 0.86, params.half_size_y * 0.42, lamp_z),
+                material="car_tail_lamp",
+            )
+            self._set_accent(
+                3,
+                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=(0.0013, 0.0038, 0.0018),
+                position=(-params.half_size_x * 0.86, -params.half_size_y * 0.42, lamp_z),
+                material="car_tail_lamp",
+            )
+            self._set_accent(
+                4,
+                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=(0.026, 0.0012, 0.0030),
+                position=(
+                    0.0,
+                    self.model.geom_size[self._object_geom_id, 1] + 0.0012,
+                    self.model.geom_pos[self._object_geom_id, 2] + 0.0010,
+                ),
+                material="car_racing_stripe",
+            )
+            self._set_accent(
+                5,
+                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=(0.026, 0.0012, 0.0030),
+                position=(
+                    0.0,
+                    -self.model.geom_size[self._object_geom_id, 1] - 0.0012,
+                    self.model.geom_pos[self._object_geom_id, 2] + 0.0010,
+                ),
+                material="car_racing_stripe",
+            )
+            for accent_index, wheel_name in enumerate(
+                (
+                    "object_wheel_fl_geom",
+                    "object_wheel_fr_geom",
+                    "object_wheel_rl_geom",
+                    "object_wheel_rr_geom",
+                ),
+                start=6,
+            ):
+                wheel_id = self._compound_geom_ids[wheel_name]
+                position = self.model.geom_pos[wheel_id].copy()
+                side = 1.0 if position[1] >= 0.0 else -1.0
+                wheel_radius = float(self.model.geom_size[wheel_id, 0])
+                position[1] += side * wheel_radius * 0.80
+                self._set_accent(
+                    accent_index,
+                    geom_type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                    size=(wheel_radius * 0.55, 0.0, 0.0),
+                    position=tuple(float(value) for value in position),
+                    material="car_hubcap",
+                )
+
+    def _show_material(self, geom_id: int, material: str) -> None:
+        material_id = self._material_ids[material]
+        self.model.geom_matid[geom_id] = material_id
+        self.model.geom_rgba[geom_id] = self.model.mat_rgba[material_id]
+
+    def _set_accent(
+        self,
+        index: int,
+        *,
+        geom_type: mujoco.mjtGeom,
+        size: tuple[float, float, float],
+        position: tuple[float, float, float],
+        material: str,
+    ) -> None:
+        geom_id = self._accent_geom_ids[index]
+        self.model.geom_type[geom_id] = int(geom_type)
+        self.model.geom_size[geom_id] = size
+        self.model.geom_pos[geom_id] = position
+        self.model.geom_rbound[geom_id] = float(np.linalg.norm(size))
+        self._show_material(geom_id, material)
 
     @staticmethod
     def _geom_type(shape: str) -> int:
@@ -462,32 +737,39 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             "box": int(mujoco.mjtGeom.mjGEOM_BOX),
             "capsule": int(mujoco.mjtGeom.mjGEOM_CAPSULE),
             "ellipsoid": int(mujoco.mjtGeom.mjGEOM_ELLIPSOID),
+            "chassis": int(mujoco.mjtGeom.mjGEOM_BOX),
         }[shape]
 
     @staticmethod
-    def _geom_size(params: ObjectParams) -> NDArray[np.float64]:
+    def _geom_size(params: EpisodeObject) -> NDArray[np.float64]:
         if params.shape == "cylinder":
             return np.array([params.half_size_x, params.half_size_z, 0.0])
         if params.shape == "capsule":
             cylinder_half_length = params.half_size_z - params.half_size_x
             return np.array([params.half_size_x, cylinder_half_length, 0.0])
+        if params.shape == "chassis":
+            return np.array(
+                [0.88 * params.half_size_x, 0.78 * params.half_size_y, 0.38 * params.half_size_z]
+            )
         return np.array([params.half_size_x, params.half_size_y, params.half_size_z])
 
     @staticmethod
-    def _geom_rbound(params: ObjectParams) -> float:
+    def _geom_rbound(params: EpisodeObject) -> float:
         if params.shape == "cylinder":
             return float(np.hypot(params.half_size_x, params.half_size_z))
         if params.shape == "capsule":
             return params.half_size_z
         if params.shape == "ellipsoid":
             return max(params.half_size_x, params.half_size_y, params.half_size_z)
+        if params.shape == "chassis":
+            return float(np.linalg.norm([params.half_size_x, params.half_size_y, params.half_size_z]))
         return float(np.linalg.norm([params.half_size_x, params.half_size_y, params.half_size_z]))
 
     @staticmethod
-    def _body_inertia(params: ObjectParams) -> tuple[float, float, float]:
+    def _body_inertia(params: EpisodeObject) -> tuple[float, float, float]:
         mass = params.mass
         x, y, z = params.half_size_x, params.half_size_y, params.half_size_z
-        if params.shape == "box":
+        if params.shape in {"box", "chassis"}:
             return (mass * (y**2 + z**2) / 3.0, mass * (x**2 + z**2) / 3.0, mass * (x**2 + y**2) / 3.0)
         if params.shape == "ellipsoid":
             return (mass * (y**2 + z**2) / 5.0, mass * (x**2 + z**2) / 5.0, mass * (x**2 + y**2) / 5.0)
@@ -580,6 +862,11 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             "peak_pad_force": self._peak_pad_force,
             "slip_events": self._slip_events,
             "cumulative_slip_distance": self._cumulative_slip_distance,
+            "initial_palm_height": self._initial_palm_height,
+            "initial_penetration": self._initial_penetration,
+            "settle_xy_displacement": self._settle_xy_displacement,
+            "reset_valid": self._reset_valid,
+            "rejected_reset_samples": self._rejected_reset_samples,
         }
 
     def _read_many(self, names: tuple[str, ...]) -> FloatArray:
@@ -595,8 +882,69 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         return max(0.0, self._object_height() - self._rest_object_height)
 
     def _object_tilt(self) -> float:
-        upright_z = float(self.data.xmat[self._object_body_id].reshape(3, 3)[2, 2])
-        return float(np.arccos(np.clip(upright_z, -1.0, 1.0)))
+        current_orientation = self.data.xmat[self._object_body_id].reshape(3, 3)
+        relative_orientation = self._rest_object_orientation.T @ current_orientation
+        cosine_angle = (float(np.trace(relative_orientation)) - 1.0) / 2.0
+        return float(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
 
 
-__all__ = ["BlindTouchEnv", "EnvConfig", "ObjectParams"]
+ObjectParams = EpisodeObject
+
+
+class ObservationHistory(gym.Wrapper):
+    """Expose recent touch/proprioception frames as one policy observation.
+
+    The base environment remains useful for inspection and scripted baselines.
+    PPO and SAC should consume this wrapper so that exploratory tactile changes
+    are observable when the policy decides whether to commit to a lift.
+    """
+
+    DEFAULT_HISTORY_LENGTH = 8
+
+    def __init__(
+        self, env: BlindTouchEnv, history_length: int = DEFAULT_HISTORY_LENGTH
+    ) -> None:
+        super().__init__(env)
+        if history_length < 1:
+            raise ValueError("history_length must be positive")
+        if env.observation_space.shape != (45,):
+            raise ValueError("ObservationHistory expects 45-value base observations")
+
+        self.history_length = history_length
+        self._frames = np.empty((history_length, 45), dtype=np.float32)
+        self.observation_space = spaces.Box(
+            low=np.tile(env.observation_space.low, history_length),
+            high=np.tile(env.observation_space.high, history_length),
+            dtype=np.float32,
+        )
+
+    def reset(
+        self,
+        *,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[FloatArray, dict[str, Any]]:
+        observation, info = self.env.reset(seed=seed, options=options)
+        self._frames[:] = observation
+        return self._stacked_observation(), info
+
+    def step(
+        self, action: FloatArray
+    ) -> tuple[FloatArray, float, bool, bool, dict[str, Any]]:
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        self._frames[:-1] = self._frames[1:].copy()
+        self._frames[-1] = observation
+        return self._stacked_observation(), reward, terminated, truncated, info
+
+    def _stacked_observation(self) -> FloatArray:
+        return self._frames.reshape(-1).copy()
+
+
+__all__ = [
+    "BlindTouchEnv",
+    "EnvConfig",
+    "EpisodeObject",
+    "ObjectParams",
+    "ObservationHistory",
+    "SamplingConfig",
+]
