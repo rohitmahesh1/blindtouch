@@ -13,7 +13,7 @@
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.35 0.35 0.35"/>
     <rgba haze="0.15 0.20 0.25 1"/>
-    <global azimuth="135" elevation="-25"/>
+    <global azimuth="135" elevation="-25" offwidth="1280" offheight="720"/>
   </visual>
 
   <default>
@@ -44,7 +44,8 @@
 
     <!-- touch sites collect normal contact force inside their volume. -->
     <default class="taxel">
-      <site type="box" size="0.002 0.006 0.007"
+      <!-- Slight overlap removes blind strips between adjacent artificial-skin cells. -->
+      <site type="box" size="0.004 0.008 0.0095"
             rgba="0.95 0.25 0.10 0.35" group="3"/>
     </default>
 
@@ -60,17 +61,19 @@
     <material name="rail" rgba="0.42 0.48 0.55 1"/>
     <material name="pad" rgba="0.12 0.55 0.70 1"/>
     <material name="object" rgba="0.92 0.60 0.18 1"/>
+    <include file="objects/demo_materials.xml"/>
   </asset>
 
   <worldbody>
     <light name="key_light" pos="0.25 -0.25 0.40" dir="-0.4 0.4 -1"/>
     <camera name="overview" pos="0.28 -0.28 0.22" xyaxes="0.707 0.707 0 -0.30 0.30 0.906"/>
+    <camera name="closeup" pos="0.17 -0.17 0.13" xyaxes="0.707 0.707 0 -0.30 0.30 0.906"/>
     <geom name="table" class="table_contact" type="plane" size="0.32 0.32 0.01"
           material="floor"/>
 
     <!-- positive palm_lift motion raises the entire claw and any grasped object. -->
     <body name="palm" pos="0 0 0.11">
-      <joint name="palm_lift" type="slide" axis="0 0 1" range="0 0.14"/>
+      <joint name="palm_lift" type="slide" axis="0 0 1" range="-0.02 0.14"/>
       <geom name="palm_shell" class="structure" type="cylinder" size="0.052 0.010"
             mass="0.18"/>
       <geom name="palm_cap" class="structure" type="cylinder" pos="0 0 0.012"
@@ -158,6 +161,43 @@
       <freejoint name="object_free"/>
       <geom name="object_geom" class="object_contact" type="cylinder"
             size="0.024 0.030" mass="0.10" material="object"/>
+      <!-- Runtime-enabled compound collision pieces for the chassis family. -->
+      <geom name="object_cabin_geom" class="object_contact" type="box"
+            size="0.001 0.001 0.001" mass="0" contype="0" conaffinity="0"
+            rgba="0 0 0 0"/>
+      <geom name="object_wheel_fl_geom" class="object_contact" type="sphere"
+            size="0.001" mass="0" contype="0" conaffinity="0"
+            rgba="0 0 0 0"/>
+      <geom name="object_wheel_fr_geom" class="object_contact" type="sphere"
+            size="0.001" mass="0" contype="0" conaffinity="0"
+            rgba="0 0 0 0"/>
+      <geom name="object_wheel_rl_geom" class="object_contact" type="sphere"
+            size="0.001" mass="0" contype="0" conaffinity="0"
+            rgba="0 0 0 0"/>
+      <geom name="object_wheel_rr_geom" class="object_contact" type="sphere"
+            size="0.001" mass="0" contype="0" conaffinity="0"
+            rgba="0 0 0 0"/>
+      <!-- Runtime-enabled visual-only decorations for held-out demo objects. -->
+      <geom name="object_accent_1_geom" class="structure" type="sphere"
+            size="0.001" mass="0" rgba="0 0 0 0"/>
+      <geom name="object_accent_2_geom" class="structure" type="sphere"
+            size="0.001" mass="0" rgba="0 0 0 0"/>
+      <geom name="object_accent_3_geom" class="structure" type="sphere"
+            size="0.001" mass="0" rgba="0 0 0 0"/>
+      <geom name="object_accent_4_geom" class="structure" type="sphere"
+            size="0.001" mass="0" rgba="0 0 0 0"/>
+      <geom name="object_accent_5_geom" class="structure" type="sphere"
+            size="0.001" mass="0" rgba="0 0 0 0"/>
+      <geom name="object_accent_6_geom" class="structure" type="sphere"
+            size="0.001" mass="0" rgba="0 0 0 0"/>
+      <geom name="object_accent_7_geom" class="structure" type="sphere"
+            size="0.001" mass="0" rgba="0 0 0 0"/>
+      <geom name="object_accent_8_geom" class="structure" type="sphere"
+            size="0.001" mass="0" rgba="0 0 0 0"/>
+      <geom name="object_accent_9_geom" class="structure" type="sphere"
+            size="0.001" mass="0" rgba="0 0 0 0"/>
+      <geom name="object_accent_10_geom" class="structure" type="sphere"
+            size="0.001" mass="0" rgba="0 0 0 0"/>
       <site name="object_center" type="sphere" size="0.0025"
             rgba="1 1 1 0.65" group="4"/>
     </body>
@@ -178,7 +218,7 @@
 
   <actuator>
     <position name="palm_lift_target" joint="palm_lift" kp="350" kv="25"
-              ctrlrange="0 0.14" forcerange="-80 80"/>
+              ctrlrange="-0.02 0.14" forcerange="-80 80"/>
     <position name="finger_1_target" joint="finger_1_close" kp="220" kv="4"
               ctrlrange="0 0.055" forcerange="-15 15"/>
     <position name="finger_2_target" joint="finger_2_close" kp="220" kv="4"
