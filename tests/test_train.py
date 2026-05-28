@@ -97,6 +97,27 @@ def test_learning_is_restricted_to_certified_stage_without_acknowledgement() -> 
     assert TrainingConfig("ppo").allow_uncertified_environment is False
 
 
+def test_history_safe_force_teacher_uses_only_policy_observation_history() -> None:
+    frames = np.zeros((8, 45), dtype=np.float32)
+    close_action = train_module._history_safe_force_teacher_action(frames.reshape(-1))
+    np.testing.assert_array_equal(
+        close_action, np.array([0.0, 0.18, 0.18, 0.18], dtype=np.float32)
+    )
+
+    frames[:, 12] = 0.34 / 5.0
+    frames[:, 21] = 0.34 / 5.0
+    frames[:, 43] = 1.0
+    lift_action = train_module._history_safe_force_teacher_action(frames.reshape(-1))
+    np.testing.assert_array_equal(
+        lift_action, np.array([1.0, 0.0, 0.0, 0.08], dtype=np.float32)
+    )
+
+    frames[-1, 12] = 0.60 / 5.0
+    release_action = train_module._history_safe_force_teacher_action(frames.reshape(-1))
+    assert release_action[0] == 1.0
+    assert release_action[1] < 0.0
+
+
 def test_learned_policy_evaluation_uses_360_values_and_writes_reports(tmp_path) -> None:
     policy = RecordingPolicy()
     suite = EvaluationSuite("demo", (demo_case("orange"),))
