@@ -13,11 +13,12 @@ import json
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal, Mapping, Protocol
+from typing import Any, Iterable, Literal, Mapping, Protocol
 
 import numpy as np
 from numpy.typing import NDArray
 
+from .controllers import per_finger_max_taxel_force
 from .env import BlindTouchEnv, EnvConfig, ObservationHistory
 from .evaluate import (
     HOUSEHOLD_NAMES,
@@ -38,6 +39,15 @@ CurriculumStage = Literal["upright", "all_poses", "with_chassis"]
 Observation = NDArray[np.float32]
 Action = NDArray[np.float32]
 POLICY_ENV_CONFIG = EnvConfig(max_episode_steps=140)
+BASE_OBSERVATION_SIZE = 45
+WARM_START_TARGET_FORCE = 0.40
+WARM_START_FORCE_BAND = 0.12
+WARM_START_CONTACT_THRESHOLD = 0.035
+WARM_START_CLOSE_RATE = 0.18
+WARM_START_TRIM_CLOSE_RATE = 0.08
+WARM_START_RELEASE_RATE = 0.08
+WARM_START_STABLE_WINDOW = 8
+WARM_START_LATE_LIFT_STEP = 120
 FEASIBILITY_GATE_MESSAGE = (
     "Only the upright stage-1 curriculum is currently certified for training. "
     "Use --allow-uncertified-environment only for deliberate pipeline dry runs "
@@ -68,6 +78,9 @@ class TrainingConfig:
     tensorboard_root: Path = Path("runs/tensorboard")
     device: str = "auto"
     allow_uncertified_environment: bool = False
+    warm_start_transitions: int = 0
+    warm_start_epochs: int = 4
+    warm_start_batch_size: int = 256
 
     def __post_init__(self) -> None:
         if self.algorithm not in {"ppo", "sac"}:
@@ -82,6 +95,12 @@ class TrainingConfig:
             raise ValueError("evaluation_frequency must be positive")
         if self.evaluation_limit is not None and self.evaluation_limit < 1:
             raise ValueError("evaluation_limit must be positive when provided")
+        if self.warm_start_transitions < 0:
+            raise ValueError("warm_start_transitions cannot be negative")
+        if self.warm_start_epochs < 1:
+            raise ValueError("warm_start_epochs must be positive")
+        if self.warm_start_batch_size < 1:
+            raise ValueError("warm_start_batch_size must be positive")
 
     @property
     def run_name(self) -> str:
@@ -335,11 +354,35 @@ def train(config: TrainingConfig) -> TrainingResult:
     )
     model_class = _load_algorithms()[config.algorithm]
     model = build_model(config, env)
+    if config.warm_start_transitions > 0:
+        loss = warm_start_from_safe_force_controller(model, config)
+        print(
+            f"{config.algorithm.upper()} safe-force warm start: "
+            f"{config.warm_start_transitions} transitions, final_loss={loss:.4f}"
+        )
     best_score: tuple[float, float] | None = None
     best_checkpoint = checkpoint_directory / "best.zip"
     latest_report = report_directory / "validation_interp_step_0.csv"
     next_evaluation = min(config.evaluation_frequency, config.total_timesteps)
     try:
+        if config.warm_start_transitions > 0:
+            checkpoint_base = checkpoint_directory / "step_0_warm_start"
+            model.save(str(checkpoint_base))
+            checkpoint = checkpoint_base.with_suffix(".zip")
+            loaded_model = model_class.load(str(checkpoint), device=config.device)
+            suite = build_locked_suite("validation_interp", limit=config.evaluation_limit)
+            prefix = report_directory / "validation_interp_step_0_warm_start"
+            records = evaluate_policy(
+                loaded_model,
+                suite,
+                algorithm=config.algorithm,
+                checkpoint=str(checkpoint),
+                history_length=config.history_length,
+                output_prefix=prefix,
+            )
+            latest_report = prefix.with_suffix(".csv")
+            best_score = _policy_score(records)
+            shutil.copyfile(checkpoint, best_checkpoint)
         while model.num_timesteps < config.total_timesteps:
             remaining = next_evaluation - model.num_timesteps
             model.learn(total_timesteps=max(1, remaining), reset_num_timesteps=False)
@@ -388,6 +431,114 @@ def _policy_score(records: list[dict[str, Any]]) -> tuple[float, float]:
     success_rate = sum(bool(record["safe_success"]) for record in records) / len(records)
     mean_peak_force = float(np.mean([record["peak_force"] for record in records]))
     return success_rate, -mean_peak_force
+
+
+def warm_start_from_safe_force_controller(model: Any, config: TrainingConfig) -> float:
+    """Behavior-clone a small tactile force-regulation prior into the actor."""
+
+    observations, actions = _collect_safe_force_demonstrations(config)
+    try:
+        import torch as th
+    except ImportError as error:
+        raise RuntimeError("Scripted warm start requires PyTorch from Stable-Baselines3") from error
+
+    obs_tensor = th.as_tensor(observations, dtype=th.float32, device=model.device)
+    action_tensor = th.as_tensor(actions, dtype=th.float32, device=model.device)
+    rng = np.random.default_rng(config.seed + 29_000)
+    final_loss = 0.0
+    for _ in range(config.warm_start_epochs):
+        for indices in _batch_indices(
+            rng, len(observations), config.warm_start_batch_size
+        ):
+            batch_obs = obs_tensor[indices]
+            batch_actions = action_tensor[indices]
+            if config.algorithm == "ppo":
+                optimizer = model.policy.optimizer
+                predicted_actions = model.policy.get_distribution(batch_obs).mode()
+            else:
+                optimizer = model.actor.optimizer
+                predicted_actions = model.actor(batch_obs, deterministic=True)
+            loss = (predicted_actions - batch_actions).pow(2).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            final_loss = float(loss.detach().cpu().item())
+    return final_loss
+
+
+def _collect_safe_force_demonstrations(
+    config: TrainingConfig,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    observations: list[Observation] = []
+    actions: list[Action] = []
+    env = make_training_env(
+        history_length=config.history_length,
+        curriculum_stage=config.curriculum_stage,
+    )
+    seed = config.seed + 17_000
+    try:
+        stacked_observation, _ = env.reset(seed=seed)
+        while len(observations) < config.warm_start_transitions:
+            action = _history_safe_force_teacher_action(stacked_observation)
+            observations.append(stacked_observation.copy())
+            actions.append(action.copy())
+            stacked_observation, _, terminated, truncated, _ = env.step(action)
+            if terminated or truncated:
+                seed += 1
+                stacked_observation, _ = env.reset(seed=seed)
+    finally:
+        env.close()
+    return (
+        np.asarray(observations, dtype=np.float32),
+        np.asarray(actions, dtype=np.float32),
+    )
+
+
+def _batch_indices(
+    rng: np.random.Generator, count: int, batch_size: int
+) -> Iterable[NDArray[np.int64]]:
+    permutation = rng.permutation(count)
+    for start in range(0, count, batch_size):
+        yield permutation[start : start + batch_size]
+
+
+def _history_safe_force_teacher_action(stacked_observation: Observation) -> Action:
+    """Return a non-oracle warm-start action from the policy's own history input."""
+
+    frames = stacked_observation.reshape(-1, BASE_OBSERVATION_SIZE)
+    latest = frames[-1]
+    forces = per_finger_max_taxel_force(latest)
+    low = WARM_START_TARGET_FORCE - WARM_START_FORCE_BAND
+    high = WARM_START_TARGET_FORCE + WARM_START_FORCE_BAND
+    stable_window = min(WARM_START_STABLE_WINDOW, len(frames))
+    recent_forces = np.asarray(
+        [per_finger_max_taxel_force(frame) for frame in frames[-stable_window:]],
+        dtype=np.float32,
+    )
+    stable_contact = bool(
+        np.all(
+            (np.count_nonzero(recent_forces >= low, axis=1) >= 2)
+            & (np.max(recent_forces, axis=1) <= high)
+        )
+    )
+    contact_count = int(np.count_nonzero(forces >= WARM_START_CONTACT_THRESHOLD))
+    lift_phase = bool(latest[43] > 0.5)
+    already_lifting = bool(np.any(frames[:, 39] > 0.5))
+    inferred_step = (1.0 - float(latest[44])) * POLICY_ENV_CONFIG.max_episode_steps
+    late_lift = inferred_step >= WARM_START_LATE_LIFT_STEP and contact_count >= 2
+    lifting = already_lifting or (lift_phase and (stable_contact or late_lift))
+
+    if contact_count == 0:
+        finger_actions = np.full(3, WARM_START_CLOSE_RATE, dtype=np.float32)
+    else:
+        force_floor = low * 0.85 if lifting else low
+        finger_actions = np.where(
+            forces < force_floor,
+            WARM_START_TRIM_CLOSE_RATE,
+            np.where(forces > high, -WARM_START_RELEASE_RATE, 0.0),
+        ).astype(np.float32)
+    palm = 1.0 if lifting else 0.0
+    return np.r_[palm, np.clip(finger_actions, -1.0, 1.0)].astype(np.float32)
 
 
 def _load_algorithms() -> dict[AlgorithmName, Any]:
@@ -446,6 +597,24 @@ def main() -> None:
         action="store_true",
         help="Acknowledge the failing oracle feasibility gate for an intentional dry run.",
     )
+    parser.add_argument(
+        "--warm-start-transitions",
+        type=int,
+        default=0,
+        help="Behavior-clone this many tactile safe-force transitions before RL.",
+    )
+    parser.add_argument(
+        "--warm-start-epochs",
+        type=int,
+        default=4,
+        help="Supervised passes over safe-force warm-start transitions.",
+    )
+    parser.add_argument(
+        "--warm-start-batch-size",
+        type=int,
+        default=256,
+        help="Batch size for safe-force warm-start behavior cloning.",
+    )
     args = parser.parse_args()
 
     selected = ("ppo", "sac") if args.algorithm == "both" else (args.algorithm,)
@@ -487,6 +656,9 @@ def main() -> None:
                 tensorboard_root=args.tensorboard_root,
                 device=args.device,
                 allow_uncertified_environment=args.allow_uncertified_environment,
+                warm_start_transitions=args.warm_start_transitions,
+                warm_start_epochs=args.warm_start_epochs,
+                warm_start_batch_size=args.warm_start_batch_size,
             )
         )
         print(
@@ -535,4 +707,5 @@ __all__ = [
     "render_policy_checkpoint",
     "require_feasibility_acknowledgement",
     "train",
+    "warm_start_from_safe_force_controller",
 ]
