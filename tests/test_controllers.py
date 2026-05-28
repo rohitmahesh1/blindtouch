@@ -7,7 +7,9 @@ from blindtouch.controllers import (
     FixedGripController,
     OracleDebugController,
     ProbeThenLiftController,
+    SafeForceGripController,
     ThresholdGripController,
+    per_finger_max_taxel_force,
 )
 from blindtouch.env import BlindTouchEnv, EnvConfig
 
@@ -42,6 +44,7 @@ def test_non_oracle_controllers_use_observation_and_internal_timing_only() -> No
 
     for controller in (
         FixedGripController(),
+        SafeForceGripController(),
         ThresholdGripController(),
         ProbeThenLiftController(),
     ):
@@ -73,6 +76,27 @@ def test_demo_baselines_expose_failures_and_touch_adaptation() -> None:
     assert any(outcome != "success" for outcome in threshold_outcomes)
     assert probe_outcomes == ["success"] * len(demo_objects)
     env.close()
+
+
+def test_safe_force_controller_balances_individual_fingertip_taxels() -> None:
+    observation = np.zeros(45, dtype=np.float32)
+    controller = SafeForceGripController()
+    controller.reset(observation, {"phase": "explore", "step": 0})
+
+    action = controller.act(observation, {"phase": "explore", "step": 0})
+    assert action[0] == 0.0
+    assert np.all(action[1:] > 0.0)
+
+    observation[12] = 0.80 / 5.0
+    observation[21] = 0.10 / 5.0
+    observation[30] = 0.50 / 5.0
+    forces = per_finger_max_taxel_force(observation)
+    np.testing.assert_allclose(forces, [0.80, 0.10, 0.50], atol=1e-6)
+
+    action = controller.act(observation, {"phase": "explore", "step": 1})
+    assert action[1] < 0.0
+    assert action[2] > 0.0
+    assert action[3] == 0.0
 
 
 def test_oracle_debug_controller_certifies_named_feasible_suite() -> None:
