@@ -42,6 +42,21 @@ class EnvConfig:
     contact_force_threshold: float = 0.02
     tactile_force_scale: float = 5.0
     velocity_scale: float = 0.5
+    contact_reward_scale: float = 0.045
+    contact_balance_reward_scale: float = 0.035
+    no_contact_penalty: float = 0.010
+    single_contact_penalty: float = 0.018
+    coordinated_probe_reward_scale: float = 0.008
+    safe_force_band_reward_scale: float = 0.025
+    over_force_penalty_scale: float = 0.35
+    premature_lift_penalty: float = 0.025
+    ready_lift_bonus: float = 0.020
+    success_reward: float = 15.0
+    damage_penalty: float = 8.0
+    drop_penalty: float = 2.5
+    unstable_penalty: float = 3.0
+    timeout_penalty: float = 2.0
+    no_grip_timeout_penalty: float = 1.0
     max_tilt_radians: float = np.deg2rad(40.0)
     slip_distance_threshold: float = 0.0005
     reset_clearance: float = 0.001
@@ -283,6 +298,9 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._successful_hold_steps = 0
         self._slip_events = 0
         self._peak_pad_force = 0.0
+        self._contact_steps = 0
+        self._first_contact_step: int | None = None
+        self._max_contact_count = 0
         self._rest_object_height = self._object_height()
         self._previous_lift_height = 0.0
         self._previous_object_xy = self.data.xpos[self._object_body_id, :2].copy()
@@ -340,6 +358,12 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         object_xy = self.data.xpos[self._object_body_id, :2].copy()
         lateral_distance = float(np.linalg.norm(object_xy - self._previous_object_xy))
         contacting = int(np.count_nonzero(pad_forces > self.config.contact_force_threshold))
+        grip_metrics = self._grip_metrics(pad_forces)
+        if contacting > 0:
+            self._contact_steps += 1
+            if self._first_contact_step is None:
+                self._first_contact_step = self._step_count
+        self._max_contact_count = max(self._max_contact_count, contacting)
         palm_has_lifted = (
             self.data.qpos[self._palm_qpos_adr] - self._initial_palm_height
             > self.config.attempted_lift_height
@@ -384,6 +408,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             unstable=unstable,
             succeeded=succeeded,
             lift_allowed=lift_allowed,
+            grip_metrics=grip_metrics,
         )
         if damaged:
             self._outcome = "damage"
@@ -398,6 +423,9 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         truncated = bool(not terminated and self._step_count >= self.config.max_episode_steps)
         if truncated:
             self._outcome = "timeout"
+            reward -= self.config.timeout_penalty
+            if self._max_contact_count < 2:
+                reward -= self.config.no_grip_timeout_penalty
 
         self._previous_lift_height = lift_height
         self._previous_object_xy = object_xy
@@ -804,25 +832,104 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         unstable: bool,
         succeeded: bool,
         lift_allowed: bool,
+        grip_metrics: Mapping[str, float],
     ) -> float:
         safe_force = self.object_params.safe_force if self.object_params else 1.0
         force_fraction = float(np.max(pad_forces) / safe_force)
-        reward = -0.005
-        reward -= 0.002 * float(np.mean(np.square(action)))
-        reward -= 0.006 * force_fraction**2
+        contact_count = int(grip_metrics["contact_count"])
+        grip_score = float(grip_metrics["grip_score"])
+        balance_score = float(grip_metrics["balance_score"])
+        reward = -0.004
+        reward -= 0.001 * float(np.mean(np.square(action)))
+        reward -= 0.003 * force_fraction**2
+        if force_fraction > 0.70:
+            reward -= 0.080 * (force_fraction - 0.70) ** 2
+
+        finger_closing = np.clip(action[1:], 0.0, 1.0)
+        mean_finger_close = float(np.mean(finger_closing))
+        close_symmetry = 1.0 - float(np.std(finger_closing))
+        if not lift_allowed and contact_count < 2:
+            reward += (
+                self.config.coordinated_probe_reward_scale
+                * mean_finger_close
+                * np.clip(close_symmetry, 0.0, 1.0)
+            )
+        reward += self.config.contact_reward_scale * grip_score
+        if contact_count >= 2:
+            reward += self.config.contact_balance_reward_scale * balance_score
+            safe_margin_score = float(np.clip((0.62 - force_fraction) / 0.62, 0.0, 1.0))
+            reward += self.config.safe_force_band_reward_scale * grip_score * safe_margin_score
+        elif contact_count == 1:
+            strongest_contact = float(np.max(pad_forces) / grip_metrics["target_pad_force"])
+            reward -= self.config.single_contact_penalty * min(strongest_contact, 2.0)
+        elif self._step_count > 8:
+            reward -= self.config.no_contact_penalty * (1.0 - grip_score)
+        if force_fraction > 0.55:
+            reward -= self.config.over_force_penalty_scale * (force_fraction - 0.55) ** 2
+
         if lift_allowed:
             reward += 4.0 * (lift_height - self._previous_lift_height) / self.config.lift_target_height
+            lift_request = max(float(action[0]), 0.0)
+            if lift_request > 0.0 and grip_score < 0.45:
+                reward -= self.config.premature_lift_penalty * lift_request * (1.0 - grip_score)
+            elif lift_request > 0.0 and contact_count >= 2:
+                reward += self.config.ready_lift_bonus * lift_request * grip_score
+            if self._step_count > self.config.exploration_steps + 12 and contact_count == 0:
+                reward -= self.config.no_contact_penalty
         if slipped:
             reward -= 0.25
         if damaged:
-            reward -= 10.0
+            reward -= self.config.damage_penalty
         elif unstable:
-            reward -= 5.0
+            reward -= self.config.unstable_penalty
         elif dropped:
-            reward -= 5.0
+            reward -= self.config.drop_penalty
         elif succeeded:
-            reward += 10.0
+            reward += self.config.success_reward
         return reward
+
+    def _grip_metrics(self, pad_forces: FloatArray) -> dict[str, float]:
+        if self.object_params is None:
+            return {
+                "contact_count": 0.0,
+                "grip_score": 0.0,
+                "balance_score": 0.0,
+                "target_pad_force": self.config.contact_force_threshold,
+            }
+
+        required_pad_force = self.object_params.mass * 9.81 / (
+            3.0 * self.object_params.friction
+        )
+        target_pad_force = float(
+            np.clip(
+                required_pad_force * 1.15,
+                self.config.contact_force_threshold * 2.0,
+                self.object_params.safe_force * 0.55,
+            )
+        )
+        normalized_forces = np.clip(pad_forces / target_pad_force, 0.0, 1.0)
+        strongest_two = np.sort(normalized_forces)[-2:]
+        contact_count = int(np.count_nonzero(pad_forces > self.config.contact_force_threshold))
+        two_finger_score = float(np.mean(strongest_two)) if contact_count >= 2 else 0.0
+        three_finger_coverage = float(np.count_nonzero(normalized_forces > 0.25) / 3.0)
+        active_forces = pad_forces[pad_forces > self.config.contact_force_threshold]
+        if active_forces.size >= 2:
+            imbalance = float(np.std(active_forces) / max(target_pad_force, 1e-6))
+            balance_score = float(np.clip(1.0 - imbalance, 0.0, 1.0))
+        else:
+            balance_score = 0.0
+        if contact_count >= 2:
+            grip_score = float(
+                np.clip(0.75 * two_finger_score + 0.25 * three_finger_coverage, 0.0, 1.0)
+            )
+        else:
+            grip_score = 0.0
+        return {
+            "contact_count": float(contact_count),
+            "grip_score": grip_score,
+            "balance_score": balance_score,
+            "target_pad_force": target_pad_force,
+        }
 
     def _observation(self) -> FloatArray:
         joint_pos = self._read_many(self.JOINT_POS_NAMES)
@@ -849,6 +956,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
     def _info(self) -> dict[str, Any]:
         params = asdict(self.object_params) if self.object_params else {}
         pad_forces = self._pad_forces()
+        grip_metrics = self._grip_metrics(pad_forces)
         return {
             "phase": "lift" if self._step_count >= self.config.exploration_steps else "explore",
             "step": self._step_count,
@@ -860,6 +968,13 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             "control_targets": self._control_targets.copy(),
             "pad_forces": pad_forces.copy(),
             "peak_pad_force": self._peak_pad_force,
+            "contact_count": int(grip_metrics["contact_count"]),
+            "contact_steps": self._contact_steps,
+            "first_contact_step": self._first_contact_step,
+            "max_contact_count": self._max_contact_count,
+            "grip_score": float(grip_metrics["grip_score"]),
+            "contact_balance_score": float(grip_metrics["balance_score"]),
+            "target_pad_force": float(grip_metrics["target_pad_force"]),
             "slip_events": self._slip_events,
             "cumulative_slip_distance": self._cumulative_slip_distance,
             "initial_palm_height": self._initial_palm_height,
