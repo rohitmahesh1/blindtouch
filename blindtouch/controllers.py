@@ -38,6 +38,23 @@ def maximum_taxel_force(
     return float(np.max(observation[TAXEL_SLICE])) * tactile_force_scale
 
 
+def fingertip_taxel_forces(
+    observation: Observation, tactile_force_scale: float = DEFAULT_TACTILE_FORCE_SCALE
+) -> NDArray[np.float32]:
+    """Return per-finger tactile-cell forces in newtons as a 3x9 array."""
+
+    taxels = np.asarray(observation[TAXEL_SLICE], dtype=np.float32).reshape(3, 9)
+    return taxels * np.float32(tactile_force_scale)
+
+
+def per_finger_max_taxel_force(
+    observation: Observation, tactile_force_scale: float = DEFAULT_TACTILE_FORCE_SCALE
+) -> NDArray[np.float32]:
+    """Return each fingertip's strongest observed taxel force in newtons."""
+
+    return np.max(fingertip_taxel_forces(observation, tactile_force_scale), axis=1)
+
+
 def _action(palm: float = 0.0, fingers: float = 0.0) -> Action:
     return np.array([palm, fingers, fingers, fingers], dtype=np.float32)
 
@@ -91,6 +108,78 @@ class ThresholdGripController:
         if maximum_taxel_force(observation, self.tactile_force_scale) >= self.force_target:
             self._lifting = True
         return _action(palm=self.lift_rate) if self._lifting else _action(fingers=self.close_rate)
+
+
+@dataclass
+class SafeForceGripController:
+    """Balance fingertip forces in a modest tactile band before lifting.
+
+    This is intentionally a non-oracle teacher: it only reads taxels and timing,
+    not hidden mass, friction, safe-force limits, labels, or diagnostic pad force.
+    """
+
+    target_force: float = 0.50
+    force_band: float = 0.14
+    contact_threshold: float = 0.035
+    close_rate: float = 0.18
+    trim_close_rate: float = 0.08
+    release_rate: float = 0.06
+    lift_rate: float = 1.0
+    stable_steps_required: int = 8
+    max_probe_steps: int = 100
+    tactile_force_scale: float = DEFAULT_TACTILE_FORCE_SCALE
+    _step: int = field(init=False, default=0)
+    _stable_steps: int = field(init=False, default=0)
+    _lifting: bool = field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        if self.target_force <= 0.0:
+            raise ValueError("target_force must be positive")
+        if self.force_band <= 0.0:
+            raise ValueError("force_band must be positive")
+        if self.max_probe_steps < 1:
+            raise ValueError("max_probe_steps must be positive")
+
+    def reset(self, observation: Observation, info: Mapping[str, Any]) -> None:
+        del observation, info
+        self._step = 0
+        self._stable_steps = 0
+        self._lifting = False
+
+    def act(self, observation: Observation, info: Mapping[str, Any]) -> Action:
+        del info
+        forces = per_finger_max_taxel_force(observation, self.tactile_force_scale)
+        low = self.target_force - self.force_band
+        high = self.target_force + self.force_band
+        contact_count = int(np.count_nonzero(forces >= self.contact_threshold))
+        ready_count = int(np.count_nonzero(forces >= low))
+        balanced = bool(ready_count >= 2 and np.max(forces) <= high)
+        self._stable_steps = self._stable_steps + 1 if balanced else 0
+        self._lifting = self._lifting or (
+            self._stable_steps >= self.stable_steps_required
+            or (self._step >= self.max_probe_steps and contact_count >= 2)
+        )
+
+        if contact_count == 0:
+            finger_actions = np.full(3, self.close_rate, dtype=np.float32)
+        else:
+            finger_actions = np.where(
+                forces < low,
+                self.trim_close_rate,
+                np.where(forces > high, -self.release_rate, 0.0),
+            ).astype(np.float32)
+        if self._lifting:
+            palm = self.lift_rate
+            finger_actions = np.where(
+                forces < low * 0.85,
+                self.trim_close_rate,
+                np.where(forces > high, -self.release_rate, 0.0),
+            ).astype(np.float32)
+        else:
+            palm = 0.0
+
+        self._step += 1
+        return np.r_[palm, np.clip(finger_actions, -1.0, 1.0)].astype(np.float32)
 
 
 @dataclass
@@ -270,6 +359,9 @@ __all__ = [
     "FixedGripController",
     "OracleDebugController",
     "ProbeThenLiftController",
+    "SafeForceGripController",
     "ThresholdGripController",
+    "fingertip_taxel_forces",
     "maximum_taxel_force",
+    "per_finger_max_taxel_force",
 ]
