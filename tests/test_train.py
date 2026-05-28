@@ -37,6 +37,8 @@ def test_training_contract_uses_stacked_touch_observations_for_both_algorithms()
     ppo = algorithm_hyperparameters("ppo")
     sac = algorithm_hyperparameters("sac")
     assert ppo["policy_kwargs"] == sac["policy_kwargs"] == {"net_arch": [256, 256]}
+    assert ppo["learning_rate"] == pytest.approx(3e-4)
+    assert sac["learning_rate"] == pytest.approx(1e-4)
     assert ppo["n_steps"] == 2048
     assert ppo["gae_lambda"] == pytest.approx(0.95)
     assert sac["buffer_size"] == 1_000_000
@@ -46,6 +48,14 @@ def test_training_contract_uses_stacked_touch_observations_for_both_algorithms()
 
 
 def test_curriculum_expands_poses_then_adds_compound_chassis_family() -> None:
+    robust = make_training_env(curriculum_stage="robust_upright")
+    robust_metadata = [robust.reset(seed=seed)[1]["object_params"] for seed in range(30)]
+    assert all(metadata["pose"] == "upright" for metadata in robust_metadata)
+    assert all(metadata["family"] in {"rounded", "container"} for metadata in robust_metadata)
+    assert all(metadata["friction"] >= 0.65 for metadata in robust_metadata)
+    assert all(metadata["mass"] <= 0.110 for metadata in robust_metadata)
+    robust.close()
+
     upright = make_training_env(curriculum_stage="upright")
     upright_metadata = [upright.reset(seed=seed)[1]["object_params"] for seed in range(30)]
     assert all(metadata["pose"] == "upright" for metadata in upright_metadata)
@@ -66,6 +76,15 @@ def test_curriculum_expands_poses_then_adds_compound_chassis_family() -> None:
     assert stage_one.allowed_poses == ("upright",)
     assert stage_one.offset_range == (-0.002, 0.002)
     assert stage_one.safe_force_margin == pytest.approx(3.0)
+    robust_stage = curriculum_sampling_config("robust_upright")
+    assert robust_stage.training_families == ("rounded", "container")
+    assert robust_stage.friction_range == (0.65, 1.20)
+    assert robust_stage.mass_range == (0.030, 0.110)
+    assert robust_stage.safe_force_margin == pytest.approx(4.0)
+    fragile_stage = curriculum_sampling_config("fragile_upright")
+    assert fragile_stage.training_families == ("rounded", "container", "package")
+    assert fragile_stage.allowed_poses == ("upright",)
+    assert fragile_stage.safe_force_headroom_range == (2.60, 3.80)
 
 
 def test_stacked_policy_controller_matches_training_history_layout() -> None:
@@ -88,6 +107,9 @@ def test_stacked_policy_controller_matches_training_history_layout() -> None:
 
 def test_learning_is_restricted_to_certified_stage_without_acknowledgement() -> None:
     require_feasibility_acknowledgement("upright", False)
+    require_feasibility_acknowledgement("robust_upright", False)
+    with pytest.raises(RuntimeError, match="upright stage-1"):
+        require_feasibility_acknowledgement("fragile_upright", False)
     with pytest.raises(RuntimeError, match="upright stage-1"):
         require_feasibility_acknowledgement("all_poses", False)
     with pytest.raises(RuntimeError, match="upright stage-1"):
@@ -95,6 +117,56 @@ def test_learning_is_restricted_to_certified_stage_without_acknowledgement() -> 
     require_feasibility_acknowledgement("with_chassis", True)
     assert "currently certified" in FEASIBILITY_GATE_MESSAGE
     assert TrainingConfig("ppo").allow_uncertified_environment is False
+
+
+def test_sac_bc_anchor_requires_warm_start_demonstrations() -> None:
+    with pytest.raises(ValueError, match="requires warm_start_transitions"):
+        TrainingConfig("sac", sac_bc_anchor_weight=1.0)
+    with pytest.raises(ValueError, match="cannot be negative"):
+        TrainingConfig("sac", warm_start_transitions=1, sac_bc_anchor_weight=-1.0)
+    with pytest.raises(ValueError, match="batch_size must be positive"):
+        TrainingConfig(
+            "sac",
+            warm_start_transitions=1,
+            sac_bc_anchor_weight=1.0,
+            sac_bc_anchor_batch_size=0,
+        )
+
+
+def test_sac_bc_anchor_configuration_attaches_demonstrations() -> None:
+    class DummyAnchoredSac:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def set_bc_anchor(self, observations, actions, **kwargs) -> None:
+            self.calls.append(
+                {
+                    "observations": observations,
+                    "actions": actions,
+                    **kwargs,
+                }
+            )
+
+    model = DummyAnchoredSac()
+    observations = np.zeros((3, 360), dtype=np.float32)
+    actions = np.zeros((3, 4), dtype=np.float32)
+    config = TrainingConfig(
+        "sac",
+        seed=7,
+        warm_start_transitions=3,
+        sac_bc_anchor_weight=2.5,
+        sac_bc_anchor_batch_size=64,
+    )
+
+    train_module._configure_sac_bc_anchor(model, config, observations, actions)
+
+    assert len(model.calls) == 1
+    call = model.calls[0]
+    assert call["observations"] is observations
+    assert call["actions"] is actions
+    assert call["weight"] == pytest.approx(2.5)
+    assert call["batch_size"] == 64
+    assert call["seed"] == 41007
 
 
 def test_history_safe_force_teacher_uses_only_policy_observation_history() -> None:
