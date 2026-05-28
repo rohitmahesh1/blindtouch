@@ -232,6 +232,61 @@ def test_reward_shaping_prefers_balanced_touch_to_inaction() -> None:
     env.close()
 
 
+def test_reward_shaping_discourages_stalled_grip_after_exploration() -> None:
+    env = BlindTouchEnv()
+    env.reset(options={"object_params": FIXED_OBJECT})
+    env._step_count = env.config.exploration_steps + 20
+    env._previous_lift_height = 0.0
+    balanced_touch = np.array([0.12, 0.11, 0.10], dtype=np.float32)
+    metrics = env._grip_metrics(balanced_touch)
+
+    stalled_reward = env._reward(
+        action=np.zeros(4, dtype=np.float32),
+        pad_forces=balanced_touch,
+        lift_height=0.0,
+        slipped=False,
+        damaged=False,
+        dropped=False,
+        unstable=False,
+        succeeded=False,
+        lift_allowed=True,
+        grip_metrics=metrics,
+    )
+    lifting_reward = env._reward(
+        action=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        pad_forces=balanced_touch,
+        lift_height=0.002,
+        slipped=False,
+        damaged=False,
+        dropped=False,
+        unstable=False,
+        succeeded=False,
+        lift_allowed=True,
+        grip_metrics=metrics,
+    )
+
+    assert metrics["grip_score"] >= 0.45
+    assert lifting_reward > stalled_reward
+    env.close()
+
+
+def test_timeout_penalty_marks_no_lift_timeouts_as_expensive() -> None:
+    env = BlindTouchEnv()
+    env.reset(options={"object_params": FIXED_OBJECT})
+    env._max_contact_count = 3
+    env._max_lift_height = 0.0
+    no_lift_penalty = env._timeout_penalty()
+
+    env._max_lift_height = env.config.lift_target_height * 0.80
+    partial_lift_penalty = env._timeout_penalty()
+
+    assert no_lift_penalty == pytest.approx(
+        env.config.timeout_penalty + env.config.no_lift_timeout_penalty
+    )
+    assert partial_lift_penalty < no_lift_penalty
+    env.close()
+
+
 def test_force_limit_terminates_a_fragile_grasp_as_damage() -> None:
     fragile_object = {**FIXED_OBJECT, "safe_force": 0.1}
     env = BlindTouchEnv(config=EnvConfig(exploration_steps=0, max_episode_steps=50))
