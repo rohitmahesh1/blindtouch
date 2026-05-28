@@ -82,6 +82,9 @@ class SamplingConfig:
     training_families: tuple[str, ...] = ("rounded", "container", "package", "chassis")
     allowed_poses: tuple[str, ...] | None = None
     offset_range: FloatRange = (-0.006, 0.006)
+    friction_range: FloatRange | None = None
+    mass_range: FloatRange | None = None
+    safe_force_headroom_range: FloatRange | None = None
     nominal_pad_force_capacity: float = 0.70
     holding_force_margin: float = 0.80
     safe_force_margin: float = 1.35
@@ -324,7 +327,9 @@ def sample_training_object(
         )
     pose = stable_poses[int(rng.integers(len(stable_poses)))]
     x, y, z = _sample_dimensions(rng, family, shape)
-    friction = float(rng.uniform(*family.friction_range))
+    friction_range = _intersect_range(family.friction_range, settings.friction_range, "friction")
+    mass_range = _intersect_range(family.mass_range, settings.mass_range, "mass")
+    friction = float(rng.uniform(*friction_range))
     feasible_mass_ceiling = (
         3.0
         * friction
@@ -332,12 +337,10 @@ def sample_training_object(
         * settings.holding_force_margin
         / 9.81
     )
-    upper_mass = max(family.mass_range[0], min(family.mass_range[1], feasible_mass_ceiling))
-    mass = float(rng.uniform(family.mass_range[0], upper_mass))
+    upper_mass = max(mass_range[0], min(mass_range[1], feasible_mass_ceiling))
+    mass = float(rng.uniform(mass_range[0], upper_mass))
     required_pad_force = mass * 9.81 / (3.0 * friction)
-    safe_min = max(family.safe_force_range[0], required_pad_force * settings.safe_force_margin)
-    safe_max = max(safe_min, family.safe_force_range[1])
-    safe_force = float(rng.uniform(safe_min, safe_max))
+    safe_force = _sample_safe_force(rng, family, settings, required_pad_force)
     yaw = float(rng.uniform(*pose.yaw_range))
     dimensions = (x, y, z)
     resting_half_height = pose.resting_half_height(dimensions)
@@ -447,6 +450,39 @@ def _sample_dimensions(
     if shape == "capsule":
         z = max(z, x + 0.004)
     return x, y, z
+
+
+def _intersect_range(
+    base_range: FloatRange, requested_range: FloatRange | None, label: str
+) -> FloatRange:
+    if requested_range is None:
+        return base_range
+    lower = max(base_range[0], requested_range[0])
+    upper = min(base_range[1], requested_range[1])
+    if lower > upper:
+        raise ValueError(
+            f"Requested {label}_range={requested_range!r} does not overlap {base_range!r}"
+        )
+    return lower, upper
+
+
+def _sample_safe_force(
+    rng: np.random.Generator,
+    family: ObjectFamily,
+    settings: SamplingConfig,
+    required_pad_force: float,
+) -> float:
+    if settings.safe_force_headroom_range is not None:
+        lower, upper = settings.safe_force_headroom_range
+        if lower <= 0.0 or upper < lower:
+            raise ValueError("safe_force_headroom_range must be positive and ordered")
+        headroom = float(rng.uniform(lower, upper))
+        safe_force = required_pad_force * headroom
+        return float(np.clip(safe_force, *family.safe_force_range))
+
+    safe_min = max(family.safe_force_range[0], required_pad_force * settings.safe_force_margin)
+    safe_max = max(safe_min, family.safe_force_range[1])
+    return float(rng.uniform(safe_min, safe_max))
 
 
 def _apply_yaw(base: Quaternion, yaw: float) -> Quaternion:
