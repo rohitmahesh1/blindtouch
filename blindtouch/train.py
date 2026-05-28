@@ -35,21 +35,23 @@ from .objects import SamplingConfig
 
 
 AlgorithmName = Literal["ppo", "sac"]
-CurriculumStage = Literal["upright", "all_poses", "with_chassis"]
+CurriculumStage = Literal[
+    "robust_upright", "upright", "fragile_upright", "all_poses", "with_chassis"
+]
 Observation = NDArray[np.float32]
 Action = NDArray[np.float32]
 POLICY_ENV_CONFIG = EnvConfig(max_episode_steps=140)
 BASE_OBSERVATION_SIZE = 45
-WARM_START_TARGET_FORCE = 0.40
-WARM_START_FORCE_BAND = 0.12
+WARM_START_TARGET_FORCE = 0.34
+WARM_START_FORCE_BAND = 0.10
 WARM_START_CONTACT_THRESHOLD = 0.035
 WARM_START_CLOSE_RATE = 0.18
 WARM_START_TRIM_CLOSE_RATE = 0.08
-WARM_START_RELEASE_RATE = 0.08
+WARM_START_RELEASE_RATE = 0.12
 WARM_START_STABLE_WINDOW = 8
-WARM_START_LATE_LIFT_STEP = 120
+WARM_START_LATE_LIFT_STEP = 125
 FEASIBILITY_GATE_MESSAGE = (
-    "Only the upright stage-1 curriculum is currently certified for training. "
+    "Only the robust_upright and upright stage-1 curricula are currently certified for training. "
     "Use --allow-uncertified-environment only for deliberate pipeline dry runs "
     "on all_poses or with_chassis."
 )
@@ -81,6 +83,8 @@ class TrainingConfig:
     warm_start_transitions: int = 0
     warm_start_epochs: int = 4
     warm_start_batch_size: int = 256
+    sac_bc_anchor_weight: float = 0.0
+    sac_bc_anchor_batch_size: int = 256
 
     def __post_init__(self) -> None:
         if self.algorithm not in {"ppo", "sac"}:
@@ -89,7 +93,13 @@ class TrainingConfig:
             raise ValueError("total_timesteps must be positive")
         if self.history_length < 1:
             raise ValueError("history_length must be positive")
-        if self.curriculum_stage not in {"upright", "all_poses", "with_chassis"}:
+        if self.curriculum_stage not in {
+            "robust_upright",
+            "upright",
+            "fragile_upright",
+            "all_poses",
+            "with_chassis",
+        }:
             raise ValueError(f"Unsupported curriculum stage: {self.curriculum_stage!r}")
         if self.evaluation_frequency < 1:
             raise ValueError("evaluation_frequency must be positive")
@@ -101,6 +111,12 @@ class TrainingConfig:
             raise ValueError("warm_start_epochs must be positive")
         if self.warm_start_batch_size < 1:
             raise ValueError("warm_start_batch_size must be positive")
+        if self.sac_bc_anchor_weight < 0.0:
+            raise ValueError("sac_bc_anchor_weight cannot be negative")
+        if self.sac_bc_anchor_weight > 0.0 and self.warm_start_transitions < 1:
+            raise ValueError("sac_bc_anchor_weight requires warm_start_transitions")
+        if self.sac_bc_anchor_batch_size < 1:
+            raise ValueError("sac_bc_anchor_batch_size must be positive")
 
     @property
     def run_name(self) -> str:
@@ -159,7 +175,6 @@ def algorithm_hyperparameters(algorithm: AlgorithmName) -> dict[str, Any]:
     """Return the fixed first-pass model settings from the project roadmap."""
 
     common: dict[str, Any] = {
-        "learning_rate": 3e-4,
         "batch_size": 256,
         "gamma": 0.99,
         "policy_kwargs": {"net_arch": [256, 256]},
@@ -167,12 +182,14 @@ def algorithm_hyperparameters(algorithm: AlgorithmName) -> dict[str, Any]:
     if algorithm == "ppo":
         return {
             **common,
+            "learning_rate": 3e-4,
             "n_steps": 2048,
             "gae_lambda": 0.95,
         }
     if algorithm == "sac":
         return {
             **common,
+            "learning_rate": 1e-4,
             "buffer_size": 1_000_000,
             "learning_starts": 10_000,
             "ent_coef": "auto",
@@ -199,12 +216,34 @@ def make_training_env(
 def curriculum_sampling_config(stage: CurriculumStage) -> SamplingConfig:
     """Map a curriculum stage to abstract training families and stable poses."""
 
+    if stage == "robust_upright":
+        return SamplingConfig(
+            training_families=("rounded", "container"),
+            allowed_poses=("upright",),
+            offset_range=(-0.001, 0.001),
+            friction_range=(0.65, 1.20),
+            mass_range=(0.030, 0.110),
+            nominal_pad_force_capacity=0.55,
+            holding_force_margin=0.70,
+            safe_force_margin=4.0,
+        )
     if stage == "upright":
         return SamplingConfig(
             training_families=("rounded", "container", "package"),
             allowed_poses=("upright",),
             offset_range=(-0.002, 0.002),
             safe_force_margin=3.0,
+        )
+    if stage == "fragile_upright":
+        return SamplingConfig(
+            training_families=("rounded", "container", "package"),
+            allowed_poses=("upright",),
+            offset_range=(-0.002, 0.002),
+            friction_range=(0.45, 1.10),
+            mass_range=(0.040, 0.140),
+            safe_force_headroom_range=(2.60, 3.80),
+            nominal_pad_force_capacity=0.55,
+            holding_force_margin=0.75,
         )
     if stage == "all_poses":
         return SamplingConfig(training_families=("rounded", "container", "package"))
@@ -218,7 +257,7 @@ def require_feasibility_acknowledgement(
 ) -> None:
     """Refuse accidental learning on curriculum stages not yet certified."""
 
-    if curriculum_stage != "upright" and not allow_uncertified_environment:
+    if curriculum_stage not in {"robust_upright", "upright"} and not allow_uncertified_environment:
         raise RuntimeError(FEASIBILITY_GATE_MESSAGE)
 
 
@@ -463,7 +502,29 @@ def warm_start_from_safe_force_controller(model: Any, config: TrainingConfig) ->
             loss.backward()
             optimizer.step()
             final_loss = float(loss.detach().cpu().item())
+    _configure_sac_bc_anchor(model, config, observations, actions)
     return final_loss
+
+
+def _configure_sac_bc_anchor(
+    model: Any,
+    config: TrainingConfig,
+    observations: NDArray[np.float32],
+    actions: NDArray[np.float32],
+) -> None:
+    """Attach demonstration batches for anchored SAC actor updates."""
+
+    if config.algorithm != "sac" or config.sac_bc_anchor_weight <= 0.0:
+        return
+    if not hasattr(model, "set_bc_anchor"):
+        raise RuntimeError("SAC BC anchor requires the anchored SAC training class")
+    model.set_bc_anchor(
+        observations,
+        actions,
+        weight=config.sac_bc_anchor_weight,
+        batch_size=config.sac_bc_anchor_batch_size,
+        seed=config.seed + 41_000,
+    )
 
 
 def _collect_safe_force_demonstrations(
@@ -544,12 +605,160 @@ def _history_safe_force_teacher_action(stacked_observation: Observation) -> Acti
 def _load_algorithms() -> dict[AlgorithmName, Any]:
     try:
         from stable_baselines3 import PPO, SAC
+        from stable_baselines3.common.utils import polyak_update
+        import torch as th
+        import torch.nn.functional as F
     except ImportError as error:
         raise RuntimeError(
             "Training dependencies are missing. Install stable-baselines3 and tensorboard "
             "in .venv before running blindtouch.train."
         ) from error
-    return {"ppo": PPO, "sac": SAC}
+
+    class AnchoredSAC(SAC):
+        """SAC with an optional behavior-cloning anchor for warm-start demos."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.bc_anchor_observations = None
+            self.bc_anchor_actions = None
+            self.bc_anchor_weight = 0.0
+            self.bc_anchor_batch_size = 0
+            self.bc_anchor_rng = np.random.default_rng()
+
+        def set_bc_anchor(
+            self,
+            observations: NDArray[np.float32],
+            actions: NDArray[np.float32],
+            *,
+            weight: float,
+            batch_size: int,
+            seed: int,
+        ) -> None:
+            self.bc_anchor_observations = th.as_tensor(
+                observations, dtype=th.float32, device=self.device
+            )
+            self.bc_anchor_actions = th.as_tensor(actions, dtype=th.float32, device=self.device)
+            self.bc_anchor_weight = float(weight)
+            self.bc_anchor_batch_size = int(batch_size)
+            self.bc_anchor_rng = np.random.default_rng(seed)
+
+        def _excluded_save_params(self) -> list[str]:
+            return super()._excluded_save_params() + [
+                "bc_anchor_observations",
+                "bc_anchor_actions",
+                "bc_anchor_rng",
+            ]
+
+        def train(self, gradient_steps: int, batch_size: int = 64) -> None:
+            self.policy.set_training_mode(True)
+            optimizers = [self.actor.optimizer, self.critic.optimizer]
+            if self.ent_coef_optimizer is not None:
+                optimizers += [self.ent_coef_optimizer]
+            self._update_learning_rate(optimizers)
+
+            ent_coef_losses, ent_coefs = [], []
+            actor_losses, critic_losses, bc_anchor_losses = [], [], []
+            for gradient_step in range(gradient_steps):
+                replay_data = self.replay_buffer.sample(
+                    batch_size, env=self._vec_normalize_env
+                )
+                discounts = (
+                    replay_data.discounts if replay_data.discounts is not None else self.gamma
+                )
+                if self.use_sde:
+                    self.actor.reset_noise()
+
+                actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
+                log_prob = log_prob.reshape(-1, 1)
+
+                ent_coef_loss = None
+                if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
+                    ent_coef = th.exp(self.log_ent_coef.detach())
+                    assert isinstance(self.target_entropy, float)
+                    ent_coef_loss = -(
+                        self.log_ent_coef * (log_prob + self.target_entropy).detach()
+                    ).mean()
+                    ent_coef_losses.append(ent_coef_loss.item())
+                else:
+                    ent_coef = self.ent_coef_tensor
+                ent_coefs.append(ent_coef.item())
+
+                if ent_coef_loss is not None and self.ent_coef_optimizer is not None:
+                    self.ent_coef_optimizer.zero_grad()
+                    ent_coef_loss.backward()
+                    self.ent_coef_optimizer.step()
+
+                with th.no_grad():
+                    next_actions, next_log_prob = self.actor.action_log_prob(
+                        replay_data.next_observations
+                    )
+                    next_q_values = th.cat(
+                        self.critic_target(replay_data.next_observations, next_actions),
+                        dim=1,
+                    )
+                    next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
+                    next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
+                    target_q_values = (
+                        replay_data.rewards
+                        + (1 - replay_data.dones) * discounts * next_q_values
+                    )
+
+                current_q_values = self.critic(replay_data.observations, replay_data.actions)
+                critic_loss = 0.5 * sum(
+                    F.mse_loss(current_q, target_q_values)
+                    for current_q in current_q_values
+                )
+                critic_losses.append(critic_loss.item())
+
+                self.critic.optimizer.zero_grad()
+                critic_loss.backward()
+                self.critic.optimizer.step()
+
+                q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
+                min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
+                actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+                bc_anchor_loss = self._bc_anchor_loss()
+                if bc_anchor_loss is not None:
+                    actor_loss = actor_loss + self.bc_anchor_weight * bc_anchor_loss
+                    bc_anchor_losses.append(float(bc_anchor_loss.detach().cpu().item()))
+                actor_losses.append(actor_loss.item())
+
+                self.actor.optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor.optimizer.step()
+
+                if gradient_step % self.target_update_interval == 0:
+                    polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+                    polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
+
+            self._n_updates += gradient_steps
+            self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+            self.logger.record("train/ent_coef", np.mean(ent_coefs))
+            self.logger.record("train/actor_loss", np.mean(actor_losses))
+            self.logger.record("train/critic_loss", np.mean(critic_losses))
+            if ent_coef_losses:
+                self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
+            if bc_anchor_losses:
+                self.logger.record("train/bc_anchor_loss", np.mean(bc_anchor_losses))
+                self.logger.record("train/bc_anchor_weight", self.bc_anchor_weight)
+
+        def _bc_anchor_loss(self) -> Any:
+            if (
+                self.bc_anchor_weight <= 0.0
+                or self.bc_anchor_observations is None
+                or self.bc_anchor_actions is None
+            ):
+                return None
+            count = int(self.bc_anchor_observations.shape[0])
+            batch_size = min(self.bc_anchor_batch_size, count)
+            indices = self.bc_anchor_rng.integers(0, count, size=batch_size)
+            index_tensor = th.as_tensor(indices, dtype=th.long, device=self.device)
+            observations = self.bc_anchor_observations[index_tensor]
+            target_actions = self.bc_anchor_actions[index_tensor]
+            predicted_actions = self.actor(observations, deterministic=True)
+            return F.mse_loss(predicted_actions, target_actions)
+
+    return {"ppo": PPO, "sac": AnchoredSAC}
 
 
 def _write_training_config(config: TrainingConfig, path: Path) -> None:
@@ -566,7 +775,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--stage",
-        choices=("upright", "all_poses", "with_chassis"),
+        choices=("robust_upright", "upright", "fragile_upright", "all_poses", "with_chassis"),
         default="upright",
     )
     parser.add_argument("--eval-every", type=int, default=50_000)
@@ -615,6 +824,18 @@ def main() -> None:
         default=256,
         help="Batch size for safe-force warm-start behavior cloning.",
     )
+    parser.add_argument(
+        "--sac-bc-anchor-weight",
+        type=float,
+        default=0.0,
+        help="Opt-in SAC actor loss weight for preserving warm-start demonstrations.",
+    )
+    parser.add_argument(
+        "--sac-bc-anchor-batch-size",
+        type=int,
+        default=256,
+        help="Demonstration batch size for the SAC BC-anchor regularizer.",
+    )
     args = parser.parse_args()
 
     selected = ("ppo", "sac") if args.algorithm == "both" else (args.algorithm,)
@@ -659,6 +880,8 @@ def main() -> None:
                 warm_start_transitions=args.warm_start_transitions,
                 warm_start_epochs=args.warm_start_epochs,
                 warm_start_batch_size=args.warm_start_batch_size,
+                sac_bc_anchor_weight=args.sac_bc_anchor_weight,
+                sac_bc_anchor_batch_size=args.sac_bc_anchor_batch_size,
             )
         )
         print(
