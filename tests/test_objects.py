@@ -42,6 +42,56 @@ def test_training_sampling_is_seeded_physical_and_includes_side_poses() -> None:
     assert {"side_x", "side_y"} <= poses
 
 
+def test_sampling_config_can_restrict_mass_and_friction_for_curricula() -> None:
+    config = SamplingConfig(
+        training_families=("rounded", "container"),
+        allowed_poses=("upright",),
+        friction_range=(0.65, 0.80),
+        mass_range=(0.030, 0.080),
+        safe_force_margin=4.0,
+    )
+
+    for seed in range(50):
+        sample = sample_training_object(np.random.default_rng(seed), config)
+        required_pad_force = sample.mass * 9.81 / (3.0 * sample.friction)
+        assert sample.family in {"rounded", "container"}
+        assert sample.pose == "upright"
+        assert 0.65 <= sample.friction <= 0.80
+        assert 0.030 <= sample.mass <= 0.080
+        assert sample.safe_force >= required_pad_force * 4.0
+
+    with pytest.raises(ValueError, match="does not overlap"):
+        sample_training_object(
+            np.random.default_rng(1),
+            SamplingConfig(training_families=("rounded",), friction_range=(9.0, 10.0)),
+        )
+
+
+def test_sampling_config_can_target_safe_force_headroom() -> None:
+    config = SamplingConfig(
+        training_families=("rounded",),
+        allowed_poses=("upright",),
+        friction_range=(0.45, 0.55),
+        mass_range=(0.120, 0.140),
+        safe_force_headroom_range=(1.50, 1.80),
+    )
+
+    for seed in range(20):
+        sample = sample_training_object(np.random.default_rng(seed), config)
+        required_pad_force = sample.mass * 9.81 / (3.0 * sample.friction)
+        headroom = sample.safe_force / required_pad_force
+        assert 1.50 <= headroom <= 1.80
+
+    with pytest.raises(ValueError, match="safe_force_headroom_range"):
+        sample_training_object(
+            np.random.default_rng(1),
+            SamplingConfig(
+                training_families=("rounded",),
+                safe_force_headroom_range=(0.0, 1.0),
+            ),
+        )
+
+
 def test_demo_objects_lock_household_specs_and_named_poses() -> None:
     orange = get_demo_object("orange")
     soap_edge = get_demo_object("soap_bar", "edge_resting")
