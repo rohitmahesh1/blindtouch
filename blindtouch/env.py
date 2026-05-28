@@ -49,14 +49,19 @@ class EnvConfig:
     coordinated_probe_reward_scale: float = 0.008
     safe_force_band_reward_scale: float = 0.025
     over_force_penalty_scale: float = 0.35
-    premature_lift_penalty: float = 0.025
-    ready_lift_bonus: float = 0.020
+    lift_progress_reward_scale: float = 4.0
+    lifted_grip_reward_scale: float = 0.060
+    grip_stall_penalty: float = 0.050
+    premature_lift_penalty: float = 0.120
+    ready_lift_bonus: float = 0.060
     success_reward: float = 15.0
     damage_penalty: float = 8.0
     drop_penalty: float = 2.5
     unstable_penalty: float = 3.0
-    timeout_penalty: float = 2.0
+    timeout_penalty: float = 3.0
     no_grip_timeout_penalty: float = 1.0
+    no_lift_timeout_penalty: float = 7.0
+    weak_lift_timeout_penalty: float = 5.0
     max_tilt_radians: float = np.deg2rad(40.0)
     slip_distance_threshold: float = 0.0005
     reset_clearance: float = 0.001
@@ -240,6 +245,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._peak_pad_force = 0.0
         self._rest_object_height = 0.0
         self._previous_lift_height = 0.0
+        self._max_lift_height = 0.0
         self._previous_object_xy = np.zeros(2, dtype=np.float64)
         self._rest_object_orientation = np.eye(3, dtype=np.float64)
         self._cumulative_slip_distance = 0.0
@@ -251,6 +257,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._settle_xy_displacement = 0.0
         self._reset_valid = True
         self._rejected_reset_samples = 0
+        self._lift_attempt_steps = 0
 
     def reset(
         self,
@@ -303,12 +310,14 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._max_contact_count = 0
         self._rest_object_height = self._object_height()
         self._previous_lift_height = 0.0
+        self._max_lift_height = 0.0
         self._previous_object_xy = self.data.xpos[self._object_body_id, :2].copy()
         self._rest_object_orientation = self.data.xmat[self._object_body_id].reshape(3, 3).copy()
         self._cumulative_slip_distance = 0.0
         self._previous_action.fill(0.0)
         self._initial_palm_height = float(self.data.qpos[self._palm_qpos_adr])
         self._outcome = None
+        self._lift_attempt_steps = 0
 
         observation = self._observation()
         info = self._info()
@@ -354,6 +363,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         max_force = float(np.max(pad_forces))
         self._peak_pad_force = max(self._peak_pad_force, max_force)
         lift_height = self._lift_height()
+        self._max_lift_height = max(self._max_lift_height, lift_height)
         object_falling = lift_height < self._previous_lift_height - 0.001
         object_xy = self.data.xpos[self._object_body_id, :2].copy()
         lateral_distance = float(np.linalg.norm(object_xy - self._previous_object_xy))
@@ -368,6 +378,8 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             self.data.qpos[self._palm_qpos_adr] - self._initial_palm_height
             > self.config.attempted_lift_height
         )
+        if palm_has_lifted:
+            self._lift_attempt_steps += 1
         slipped = bool(
             lift_allowed
             and palm_has_lifted
@@ -423,9 +435,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         truncated = bool(not terminated and self._step_count >= self.config.max_episode_steps)
         if truncated:
             self._outcome = "timeout"
-            reward -= self.config.timeout_penalty
-            if self._max_contact_count < 2:
-                reward -= self.config.no_grip_timeout_penalty
+            reward -= self._timeout_penalty()
 
         self._previous_lift_height = lift_height
         self._previous_object_xy = object_xy
@@ -868,12 +878,32 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             reward -= self.config.over_force_penalty_scale * (force_fraction - 0.55) ** 2
 
         if lift_allowed:
-            reward += 4.0 * (lift_height - self._previous_lift_height) / self.config.lift_target_height
+            reward += (
+                self.config.lift_progress_reward_scale
+                * (lift_height - self._previous_lift_height)
+                / self.config.lift_target_height
+            )
             lift_request = max(float(action[0]), 0.0)
             if lift_request > 0.0 and grip_score < 0.45:
                 reward -= self.config.premature_lift_penalty * lift_request * (1.0 - grip_score)
             elif lift_request > 0.0 and contact_count >= 2:
                 reward += self.config.ready_lift_bonus * lift_request * grip_score
+            lift_fraction = float(
+                np.clip(lift_height / self.config.lift_target_height, 0.0, 1.0)
+            )
+            if contact_count >= 2 and lift_height > 0.0:
+                reward += self.config.lifted_grip_reward_scale * grip_score * lift_fraction
+            if (
+                self._step_count > self.config.exploration_steps + 12
+                and contact_count >= 2
+                and grip_score >= 0.45
+                and lift_request < 0.05
+                and lift_height < self.config.attempted_lift_height
+            ):
+                stalled_fraction = 1.0 - float(
+                    np.clip(lift_height / self.config.attempted_lift_height, 0.0, 1.0)
+                )
+                reward -= self.config.grip_stall_penalty * grip_score * stalled_fraction
             if self._step_count > self.config.exploration_steps + 12 and contact_count == 0:
                 reward -= self.config.no_contact_penalty
         if slipped:
@@ -887,6 +917,19 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         elif succeeded:
             reward += self.config.success_reward
         return reward
+
+    def _timeout_penalty(self) -> float:
+        penalty = self.config.timeout_penalty
+        if self._max_contact_count < 2:
+            penalty += self.config.no_grip_timeout_penalty
+        if self._max_lift_height < self.config.attempted_lift_height * 0.50:
+            penalty += self.config.no_lift_timeout_penalty
+        elif self._max_lift_height < self.config.lift_target_height:
+            lift_fraction = float(
+                np.clip(self._max_lift_height / self.config.lift_target_height, 0.0, 1.0)
+            )
+            penalty += self.config.weak_lift_timeout_penalty * (1.0 - lift_fraction)
+        return penalty
 
     def _grip_metrics(self, pad_forces: FloatArray) -> dict[str, float]:
         if self.object_params is None:
@@ -964,6 +1007,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             "object_params": params,
             "object_height": self._object_height(),
             "lift_height": self._lift_height(),
+            "max_lift_height": self._max_lift_height,
             "tilt_radians": self._object_tilt(),
             "control_targets": self._control_targets.copy(),
             "pad_forces": pad_forces.copy(),
@@ -977,6 +1021,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             "target_pad_force": float(grip_metrics["target_pad_force"]),
             "slip_events": self._slip_events,
             "cumulative_slip_distance": self._cumulative_slip_distance,
+            "lift_attempt_steps": self._lift_attempt_steps,
             "initial_palm_height": self._initial_palm_height,
             "initial_penetration": self._initial_penetration,
             "settle_xy_displacement": self._settle_xy_displacement,
