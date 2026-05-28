@@ -192,6 +192,46 @@ def test_secure_grasp_can_lift_the_reference_object() -> None:
     env.close()
 
 
+def test_reward_shaping_prefers_balanced_touch_to_inaction() -> None:
+    env = BlindTouchEnv()
+    env.reset(options={"object_params": FIXED_OBJECT})
+    env._step_count = 12
+    action = np.zeros(4, dtype=np.float32)
+    no_touch = np.zeros(3, dtype=np.float32)
+    balanced_touch = np.array([0.12, 0.11, 0.10], dtype=np.float32)
+
+    no_touch_reward = env._reward(
+        action=action,
+        pad_forces=no_touch,
+        lift_height=0.0,
+        slipped=False,
+        damaged=False,
+        dropped=False,
+        unstable=False,
+        succeeded=False,
+        lift_allowed=False,
+        grip_metrics=env._grip_metrics(no_touch),
+    )
+    touch_metrics = env._grip_metrics(balanced_touch)
+    touch_reward = env._reward(
+        action=action,
+        pad_forces=balanced_touch,
+        lift_height=0.0,
+        slipped=False,
+        damaged=False,
+        dropped=False,
+        unstable=False,
+        succeeded=False,
+        lift_allowed=False,
+        grip_metrics=touch_metrics,
+    )
+
+    assert touch_metrics["contact_count"] == 3
+    assert touch_metrics["grip_score"] > 0.0
+    assert touch_reward > no_touch_reward
+    env.close()
+
+
 def test_force_limit_terminates_a_fragile_grasp_as_damage() -> None:
     fragile_object = {**FIXED_OBJECT, "safe_force": 0.1}
     env = BlindTouchEnv(config=EnvConfig(exploration_steps=0, max_episode_steps=50))
