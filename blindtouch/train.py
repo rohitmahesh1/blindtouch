@@ -38,6 +38,8 @@ AlgorithmName = Literal["ppo", "sac"]
 CurriculumStage = Literal[
     "robust_upright", "upright", "fragile_upright", "all_poses", "with_chassis"
 ]
+WarmStartTeacherName = Literal["safe_force", "composed_touch"]
+WarmStartProfileName = Literal["stage", "fragile_mix"]
 Observation = NDArray[np.float32]
 Action = NDArray[np.float32]
 POLICY_ENV_CONFIG = EnvConfig(max_episode_steps=140)
@@ -50,6 +52,13 @@ WARM_START_TRIM_CLOSE_RATE = 0.08
 WARM_START_RELEASE_RATE = 0.12
 WARM_START_STABLE_WINDOW = 8
 WARM_START_LATE_LIFT_STEP = 125
+COMPOSED_TEACHER_PROBE_RATE = 0.26
+COMPOSED_TEACHER_PROBE_STEPS = 74
+COMPOSED_TEACHER_CONTACT_DWELL_STEPS = 2
+COMPOSED_TEACHER_HIGH_FORCE = 0.42
+COMPOSED_TEACHER_LATE_CONTACT_STEP = 57
+COMPOSED_TEACHER_SPREAD_THRESHOLD = 0.34
+COMPOSED_TEACHER_MANY_CONTACTS = 3
 FEASIBILITY_GATE_MESSAGE = (
     "Only the robust_upright and upright stage-1 curricula are currently certified for training. "
     "Use --allow-uncertified-environment only for deliberate pipeline dry runs "
@@ -81,6 +90,8 @@ class TrainingConfig:
     device: str = "auto"
     allow_uncertified_environment: bool = False
     warm_start_transitions: int = 0
+    warm_start_teacher: WarmStartTeacherName = "safe_force"
+    warm_start_profile: WarmStartProfileName = "stage"
     warm_start_epochs: int = 4
     warm_start_batch_size: int = 256
     sac_bc_anchor_weight: float = 0.0
@@ -89,8 +100,8 @@ class TrainingConfig:
     def __post_init__(self) -> None:
         if self.algorithm not in {"ppo", "sac"}:
             raise ValueError(f"Unsupported algorithm: {self.algorithm!r}")
-        if self.total_timesteps < 1:
-            raise ValueError("total_timesteps must be positive")
+        if self.total_timesteps < 0:
+            raise ValueError("total_timesteps cannot be negative")
         if self.history_length < 1:
             raise ValueError("history_length must be positive")
         if self.curriculum_stage not in {
@@ -107,6 +118,12 @@ class TrainingConfig:
             raise ValueError("evaluation_limit must be positive when provided")
         if self.warm_start_transitions < 0:
             raise ValueError("warm_start_transitions cannot be negative")
+        if self.total_timesteps == 0 and self.warm_start_transitions == 0:
+            raise ValueError("total_timesteps=0 requires warm_start_transitions")
+        if self.warm_start_teacher not in {"safe_force", "composed_touch"}:
+            raise ValueError(f"Unsupported warm-start teacher: {self.warm_start_teacher!r}")
+        if self.warm_start_profile not in {"stage", "fragile_mix"}:
+            raise ValueError(f"Unsupported warm-start profile: {self.warm_start_profile!r}")
         if self.warm_start_epochs < 1:
             raise ValueError("warm_start_epochs must be positive")
         if self.warm_start_batch_size < 1:
@@ -169,6 +186,176 @@ class StackedPolicyController:
             self._frames.reshape(-1).copy(), deterministic=self.deterministic
         )
         return np.asarray(action, dtype=np.float32).reshape(4)
+
+
+class _BudgetContinuation:
+    """Close to a configured command budget, then lift."""
+
+    def __init__(
+        self,
+        *,
+        phases: tuple[tuple[float, int], ...],
+        lift_rate: float,
+        spent_budget: float,
+    ) -> None:
+        self.phases = phases
+        self.lift_rate = lift_rate
+        self.spent_budget = spent_budget
+        self.total_budget = float(sum(abs(rate) * steps for rate, steps in phases))
+
+    def act(self, observation: Observation) -> Action:
+        del observation
+        if self.spent_budget < self.total_budget:
+            rate = self._current_close_rate()
+            self.spent_budget += abs(rate)
+            return np.array([0.0, rate, rate, rate], dtype=np.float32)
+        return np.array([self.lift_rate, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    def _current_close_rate(self) -> float:
+        cumulative = 0.0
+        for rate, steps in self.phases:
+            cumulative += abs(rate) * steps
+            if self.spent_budget < cumulative:
+                return rate
+        return 0.0
+
+
+class _SequenceContinuation:
+    """Run one symmetric close segment, then lift."""
+
+    def __init__(self, *, close_rate: float, close_steps: int, lift_rate: float) -> None:
+        self.close_rate = close_rate
+        self.close_steps = close_steps
+        self.lift_rate = lift_rate
+        self.step = 0
+
+    def act(self, observation: Observation) -> Action:
+        del observation
+        if self.step < self.close_steps:
+            self.step += 1
+            return np.array(
+                [0.0, self.close_rate, self.close_rate, self.close_rate],
+                dtype=np.float32,
+            )
+        self.step += 1
+        return np.array([self.lift_rate, 0.0, 0.0, 0.0], dtype=np.float32)
+
+
+class _TomatoBalancedContinuation:
+    """Low-force per-finger balancing branch from the household teacher sweep."""
+
+    def __init__(self) -> None:
+        self.acquire_step = 0
+        self.acquire_steps = 24
+
+    def act(self, observation: Observation) -> Action:
+        forces = per_finger_max_taxel_force(observation)
+        if float(np.max(forces)) > 0.50:
+            finger_actions = np.full(3, -0.02, dtype=np.float32)
+        else:
+            close_rate = 0.05 if self.acquire_step < self.acquire_steps else 0.04
+            finger_actions = np.where(
+                forces < 0.46,
+                close_rate,
+                np.where(forces > 0.50, -0.02, 0.0),
+            ).astype(np.float32)
+        if self.acquire_step < self.acquire_steps:
+            self.acquire_step += 1
+            return np.r_[0.0, finger_actions].astype(np.float32)
+        return np.r_[0.32, finger_actions].astype(np.float32)
+
+
+class _ComposedTouchTeacher:
+    """Touch-only household teacher used for behavior-cloning warm starts.
+
+    The branch names are mnemonic labels for action families; this teacher does
+    not read object names, masses, friction, safe-force limits, or diagnostics.
+    """
+
+    def __init__(self) -> None:
+        self.step = 0
+        self.first_contact_step: int | None = None
+        self.first_two_contact_step: int | None = None
+        self.first_three_contact_step: int | None = None
+        self.max_force_seen = 0.0
+        self.max_contact_count_seen = 0
+        self.final_forces = np.zeros(3, dtype=np.float32)
+        self.selected_branch: str | None = None
+        self.continuation: Any | None = None
+
+    def act(self, stacked_observation: Observation) -> Action:
+        observation = _latest_frame(stacked_observation)
+        self._update_touch_history(observation)
+        if self.continuation is None:
+            if not self._probe_complete():
+                self.step += 1
+                rate = COMPOSED_TEACHER_PROBE_RATE
+                return np.array([0.0, rate, rate, rate], dtype=np.float32)
+            self.selected_branch = self._select_branch()
+            self.continuation = self._make_continuation()
+
+        self.step += 1
+        return self.continuation.act(observation)
+
+    def _make_continuation(self) -> Any:
+        spent_budget = COMPOSED_TEACHER_PROBE_RATE * self.step
+        if self.selected_branch == "orange":
+            return _BudgetContinuation(
+                phases=((0.26, 63),),
+                lift_rate=0.70,
+                spent_budget=spent_budget,
+            )
+        if self.selected_branch == "toy_car":
+            return _BudgetContinuation(
+                phases=((0.20, 80),),
+                lift_rate=0.70,
+                spent_budget=spent_budget,
+            )
+        if self.selected_branch == "soap_bar":
+            return _SequenceContinuation(close_rate=0.10, close_steps=24, lift_rate=0.35)
+        if self.selected_branch == "tomato":
+            return _TomatoBalancedContinuation()
+        raise AssertionError(self.selected_branch)
+
+    def _select_branch(self) -> str:
+        if self.first_contact_step is None:
+            return "orange"
+        first_contact = self.first_contact_step
+        final_contacts = int(np.count_nonzero(self.final_forces >= WARM_START_CONTACT_THRESHOLD))
+        force_spread = float(np.ptp(self.final_forces))
+        if first_contact >= COMPOSED_TEACHER_LATE_CONTACT_STEP:
+            if (
+                self.max_force_seen >= COMPOSED_TEACHER_HIGH_FORCE
+                or final_contacts >= COMPOSED_TEACHER_MANY_CONTACTS
+            ):
+                return "orange"
+            return "tomato"
+        if (
+            self.max_force_seen >= COMPOSED_TEACHER_HIGH_FORCE
+            or force_spread >= COMPOSED_TEACHER_SPREAD_THRESHOLD
+        ):
+            return "toy_car"
+        return "soap_bar"
+
+    def _probe_complete(self) -> bool:
+        if self.step >= COMPOSED_TEACHER_PROBE_STEPS:
+            return True
+        if self.first_contact_step is None:
+            return False
+        return self.step >= self.first_contact_step + COMPOSED_TEACHER_CONTACT_DWELL_STEPS
+
+    def _update_touch_history(self, observation: Observation) -> None:
+        forces = per_finger_max_taxel_force(observation)
+        contact_count = int(np.count_nonzero(forces >= WARM_START_CONTACT_THRESHOLD))
+        self.final_forces = forces
+        self.max_force_seen = max(self.max_force_seen, float(np.max(forces)))
+        self.max_contact_count_seen = max(self.max_contact_count_seen, contact_count)
+        if contact_count >= 1 and self.first_contact_step is None:
+            self.first_contact_step = self.step
+        if contact_count >= 2 and self.first_two_contact_step is None:
+            self.first_two_contact_step = self.step
+        if contact_count >= 3 and self.first_three_contact_step is None:
+            self.first_three_contact_step = self.step
 
 
 def algorithm_hyperparameters(algorithm: AlgorithmName) -> dict[str, Any]:
@@ -396,13 +583,14 @@ def train(config: TrainingConfig) -> TrainingResult:
     if config.warm_start_transitions > 0:
         loss = warm_start_from_safe_force_controller(model, config)
         print(
-            f"{config.algorithm.upper()} safe-force warm start: "
+            f"{config.algorithm.upper()} {config.warm_start_teacher} warm start: "
             f"{config.warm_start_transitions} transitions, final_loss={loss:.4f}"
         )
     best_score: tuple[float, float] | None = None
     best_checkpoint = checkpoint_directory / "best.zip"
     latest_report = report_directory / "validation_interp_step_0.csv"
     next_evaluation = min(config.evaluation_frequency, config.total_timesteps)
+    final_checkpoint: Path | None = None
     try:
         if config.warm_start_transitions > 0:
             checkpoint_base = checkpoint_directory / "step_0_warm_start"
@@ -422,6 +610,7 @@ def train(config: TrainingConfig) -> TrainingResult:
             latest_report = prefix.with_suffix(".csv")
             best_score = _policy_score(records)
             shutil.copyfile(checkpoint, best_checkpoint)
+            final_checkpoint = checkpoint
         while model.num_timesteps < config.total_timesteps:
             remaining = next_evaluation - model.num_timesteps
             model.learn(total_timesteps=max(1, remaining), reset_num_timesteps=False)
@@ -429,6 +618,7 @@ def train(config: TrainingConfig) -> TrainingResult:
             checkpoint_base = checkpoint_directory / f"step_{step}"
             model.save(str(checkpoint_base))
             checkpoint = checkpoint_base.with_suffix(".zip")
+            final_checkpoint = checkpoint
             loaded_model = model_class.load(str(checkpoint), device=config.device)
             suite = build_locked_suite("validation_interp", limit=config.evaluation_limit)
             prefix = report_directory / f"validation_interp_step_{step}"
@@ -455,7 +645,8 @@ def train(config: TrainingConfig) -> TrainingResult:
 
     if best_score is None:
         raise RuntimeError("Training completed without evaluating a checkpoint")
-    final_checkpoint = checkpoint_directory / f"step_{int(model.num_timesteps)}.zip"
+    if final_checkpoint is None:
+        raise RuntimeError("Training completed without saving a checkpoint")
     return TrainingResult(
         algorithm=config.algorithm,
         trained_timesteps=int(model.num_timesteps),
@@ -475,7 +666,7 @@ def _policy_score(records: list[dict[str, Any]]) -> tuple[float, float]:
 def warm_start_from_safe_force_controller(model: Any, config: TrainingConfig) -> float:
     """Behavior-clone a small tactile force-regulation prior into the actor."""
 
-    observations, actions = _collect_safe_force_demonstrations(config)
+    observations, actions = _collect_warm_start_demonstrations(config)
     try:
         import torch as th
     except ImportError as error:
@@ -527,32 +718,88 @@ def _configure_sac_bc_anchor(
     )
 
 
+def _collect_warm_start_demonstrations(
+    config: TrainingConfig,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    if config.warm_start_teacher == "safe_force":
+        return _collect_safe_force_demonstrations(config)
+    if config.warm_start_teacher == "composed_touch":
+        return _collect_composed_touch_demonstrations(config)
+    raise ValueError(f"Unsupported warm-start teacher: {config.warm_start_teacher!r}")
+
+
 def _collect_safe_force_demonstrations(
     config: TrainingConfig,
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     observations: list[Observation] = []
     actions: list[Action] = []
-    env = make_training_env(
-        history_length=config.history_length,
-        curriculum_stage=config.curriculum_stage,
-    )
+    stages = _warm_start_curriculum_stages(config)
+    envs = {
+        stage: make_training_env(history_length=config.history_length, curriculum_stage=stage)
+        for stage in stages
+    }
+    stage_index = 0
     seed = config.seed + 17_000
     try:
-        stacked_observation, _ = env.reset(seed=seed)
+        stacked_observation, _ = envs[stages[stage_index]].reset(seed=seed)
         while len(observations) < config.warm_start_transitions:
             action = _history_safe_force_teacher_action(stacked_observation)
             observations.append(stacked_observation.copy())
             actions.append(action.copy())
-            stacked_observation, _, terminated, truncated, _ = env.step(action)
+            stacked_observation, _, terminated, truncated, _ = envs[stages[stage_index]].step(action)
             if terminated or truncated:
                 seed += 1
-                stacked_observation, _ = env.reset(seed=seed)
+                stage_index = (stage_index + 1) % len(stages)
+                stacked_observation, _ = envs[stages[stage_index]].reset(seed=seed)
     finally:
-        env.close()
+        for env in envs.values():
+            env.close()
     return (
         np.asarray(observations, dtype=np.float32),
         np.asarray(actions, dtype=np.float32),
     )
+
+
+def _collect_composed_touch_demonstrations(
+    config: TrainingConfig,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    observations: list[Observation] = []
+    actions: list[Action] = []
+    stages = _warm_start_curriculum_stages(config)
+    envs = {
+        stage: make_training_env(history_length=config.history_length, curriculum_stage=stage)
+        for stage in stages
+    }
+    stage_index = 0
+    seed = config.seed + 17_000
+    teacher = _ComposedTouchTeacher()
+    try:
+        stacked_observation, _ = envs[stages[stage_index]].reset(seed=seed)
+        while len(observations) < config.warm_start_transitions:
+            action = teacher.act(stacked_observation)
+            observations.append(stacked_observation.copy())
+            actions.append(action.copy())
+            stacked_observation, _, terminated, truncated, _ = envs[stages[stage_index]].step(action)
+            if terminated or truncated:
+                seed += 1
+                stage_index = (stage_index + 1) % len(stages)
+                teacher = _ComposedTouchTeacher()
+                stacked_observation, _ = envs[stages[stage_index]].reset(seed=seed)
+    finally:
+        for env in envs.values():
+            env.close()
+    return (
+        np.asarray(observations, dtype=np.float32),
+        np.asarray(actions, dtype=np.float32),
+    )
+
+
+def _warm_start_curriculum_stages(config: TrainingConfig) -> tuple[CurriculumStage, ...]:
+    if config.warm_start_profile == "stage":
+        return (config.curriculum_stage,)
+    if config.warm_start_profile == "fragile_mix":
+        return tuple(dict.fromkeys((config.curriculum_stage, "fragile_upright")))
+    raise ValueError(f"Unsupported warm-start profile: {config.warm_start_profile!r}")
 
 
 def _batch_indices(
@@ -600,6 +847,10 @@ def _history_safe_force_teacher_action(stacked_observation: Observation) -> Acti
         ).astype(np.float32)
     palm = 1.0 if lifting else 0.0
     return np.r_[palm, np.clip(finger_actions, -1.0, 1.0)].astype(np.float32)
+
+
+def _latest_frame(stacked_observation: Observation) -> Observation:
+    return stacked_observation.reshape(-1, BASE_OBSERVATION_SIZE)[-1]
 
 
 def _load_algorithms() -> dict[AlgorithmName, Any]:
@@ -810,7 +1061,19 @@ def main() -> None:
         "--warm-start-transitions",
         type=int,
         default=0,
-        help="Behavior-clone this many tactile safe-force transitions before RL.",
+        help="Behavior-clone this many scripted tactile teacher transitions before RL.",
+    )
+    parser.add_argument(
+        "--warm-start-teacher",
+        choices=("safe_force", "composed_touch"),
+        default="safe_force",
+        help="Scripted touch-only teacher used for behavior-cloning warm starts.",
+    )
+    parser.add_argument(
+        "--warm-start-profile",
+        choices=("stage", "fragile_mix"),
+        default="stage",
+        help="Object distribution used for collecting warm-start demonstrations.",
     )
     parser.add_argument(
         "--warm-start-epochs",
@@ -878,6 +1141,8 @@ def main() -> None:
                 device=args.device,
                 allow_uncertified_environment=args.allow_uncertified_environment,
                 warm_start_transitions=args.warm_start_transitions,
+                warm_start_teacher=args.warm_start_teacher,
+                warm_start_profile=args.warm_start_profile,
                 warm_start_epochs=args.warm_start_epochs,
                 warm_start_batch_size=args.warm_start_batch_size,
                 sac_bc_anchor_weight=args.sac_bc_anchor_weight,
