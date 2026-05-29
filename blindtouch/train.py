@@ -70,8 +70,8 @@ WARM_START_TRIM_CLOSE_RATE = 0.08
 WARM_START_RELEASE_RATE = 0.12
 WARM_START_STABLE_WINDOW = 8
 WARM_START_LATE_LIFT_STEP = 125
-COMPOSED_TEACHER_PROBE_RATE = 0.26
-COMPOSED_TEACHER_PROBE_STEPS = 74
+COMPOSED_TEACHER_PROBE_RATE = 0.20
+COMPOSED_TEACHER_PROBE_STEPS = 90
 COMPOSED_TEACHER_CONTACT_DWELL_STEPS = 2
 COMPOSED_TEACHER_HIGH_FORCE = 0.42
 COMPOSED_TEACHER_LATE_CONTACT_STEP = 57
@@ -361,28 +361,94 @@ class _SequenceContinuation:
         return np.array([self.lift_rate, 0.0, 0.0, 0.0], dtype=np.float32)
 
 
-class _FragileBalancedContinuation:
-    """Low-force per-finger balancing branch for fragile tactile modes."""
+class _ForceBandContinuation:
+    """Keep fingertip forces in a tactile band before and during lift."""
 
-    def __init__(self) -> None:
-        self.acquire_step = 0
-        self.acquire_steps = 24
+    def __init__(
+        self,
+        *,
+        target_force: float,
+        force_band: float,
+        max_target_force: float | None,
+        ramp_after_steps: int,
+        ramp_rate: float,
+        close_rate: float,
+        trim_close_rate: float,
+        release_rate: float,
+        lift_rate: float,
+        stable_steps_required: int,
+        max_acquire_steps: int,
+        min_contacts: int = 2,
+    ) -> None:
+        self.target_force = target_force
+        self.force_band = force_band
+        self.max_target_force = max_target_force or target_force
+        self.ramp_after_steps = ramp_after_steps
+        self.ramp_rate = ramp_rate
+        self.close_rate = close_rate
+        self.trim_close_rate = trim_close_rate
+        self.release_rate = release_rate
+        self.lift_rate = lift_rate
+        self.stable_steps_required = stable_steps_required
+        self.max_acquire_steps = max_acquire_steps
+        self.min_contacts = min_contacts
+        self.step = 0
+        self.stable_steps = 0
+        self.lifting = False
 
     def act(self, observation: Observation) -> Action:
         forces = per_finger_max_taxel_force(observation)
-        if float(np.max(forces)) > 0.50:
-            finger_actions = np.full(3, -0.02, dtype=np.float32)
+        target = self._current_target()
+        low = target - self.force_band
+        high = target + self.force_band
+        contact_count = int(np.count_nonzero(forces >= WARM_START_CONTACT_THRESHOLD))
+        ready_count = int(np.count_nonzero(forces >= low))
+        balanced = bool(ready_count >= self.min_contacts and float(np.max(forces)) <= high)
+        self.stable_steps = self.stable_steps + 1 if balanced else 0
+        self.lifting = self.lifting or (
+            self.stable_steps >= self.stable_steps_required
+            or (self.step >= self.max_acquire_steps and ready_count >= self.min_contacts)
+        )
+
+        if contact_count == 0:
+            finger_actions = np.full(3, self.close_rate, dtype=np.float32)
         else:
-            close_rate = 0.05 if self.acquire_step < self.acquire_steps else 0.04
+            close_rate = self.trim_close_rate if self.lifting else self.close_rate
             finger_actions = np.where(
-                forces < 0.46,
+                forces < low,
                 close_rate,
-                np.where(forces > 0.50, -0.02, 0.0),
+                np.where(forces > high, -self.release_rate, 0.0),
             ).astype(np.float32)
-        if self.acquire_step < self.acquire_steps:
-            self.acquire_step += 1
-            return np.r_[0.0, finger_actions].astype(np.float32)
-        return np.r_[0.32, finger_actions].astype(np.float32)
+
+        palm = self.lift_rate if self.lifting else 0.0
+        self.step += 1
+        return np.r_[palm, np.clip(finger_actions, -1.0, 1.0)].astype(np.float32)
+
+    def _current_target(self) -> float:
+        if self.step <= self.ramp_after_steps or self.ramp_rate <= 0.0:
+            return self.target_force
+        ramp = (self.step - self.ramp_after_steps) * self.ramp_rate
+        return min(self.max_target_force, self.target_force + ramp)
+
+
+class _FragileBalancedContinuation(_ForceBandContinuation):
+    """Low-force per-finger balancing branch for fragile tactile modes."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            target_force=0.24,
+            force_band=0.04,
+            max_target_force=0.38,
+            ramp_after_steps=38,
+            ramp_rate=0.003,
+            close_rate=0.035,
+            trim_close_rate=0.018,
+            release_rate=0.060,
+            lift_rate=0.24,
+            stable_steps_required=6,
+            max_acquire_steps=34,
+            min_contacts=2,
+        )
 
 
 class _ComposedTouchTeacher:
@@ -420,10 +486,19 @@ class _ComposedTouchTeacher:
     def _make_continuation(self) -> Any:
         spent_budget = COMPOSED_TEACHER_PROBE_RATE * self.step
         if self.selected_branch == "round_retention":
-            return _BudgetContinuation(
-                phases=((0.26, 63),),
-                lift_rate=0.70,
-                spent_budget=spent_budget,
+            return _ForceBandContinuation(
+                target_force=0.48,
+                force_band=0.12,
+                max_target_force=0.68,
+                ramp_after_steps=48,
+                ramp_rate=0.004,
+                close_rate=0.14,
+                trim_close_rate=0.060,
+                release_rate=0.035,
+                lift_rate=0.55,
+                stable_steps_required=4,
+                max_acquire_steps=52,
+                min_contacts=2,
             )
         if self.selected_branch == "rigid_asymmetric":
             return _BudgetContinuation(
@@ -1185,6 +1260,8 @@ def _collect_demo_bucket(
                 ),
                 "outcomes": {},
                 "accepted_outcomes": {},
+                "branches": {},
+                "accepted_branches": {},
                 "accepted_families": {},
                 "accepted_poses": {},
             },
@@ -1198,6 +1275,8 @@ def _collect_demo_bucket(
     accepted_outcomes: dict[str, int] = {}
     accepted_families: dict[str, int] = {}
     accepted_poses: dict[str, int] = {}
+    branches: dict[str, int] = {}
+    accepted_branches: dict[str, int] = {}
     max_attempts = max(500, target_transitions)
     env = ObservationHistory(
         BlindTouchEnv(config=POLICY_ENV_CONFIG, sampling_config=bucket.sampling_config),
@@ -1219,12 +1298,15 @@ def _collect_demo_bucket(
 
             attempts += 1
             outcome = str(info["outcome"])
+            branch = teacher.selected_branch or "probe_only"
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            branches[branch] = branches.get(branch, 0) + 1
             if bucket.accept_outcomes is not None and outcome not in bucket.accept_outcomes:
                 continue
 
             accepted += 1
             accepted_outcomes[outcome] = accepted_outcomes.get(outcome, 0) + 1
+            accepted_branches[branch] = accepted_branches.get(branch, 0) + 1
             episode_object = env.unwrapped.object_params
             if episode_object is not None:
                 accepted_families[episode_object.family] = (
@@ -1254,6 +1336,8 @@ def _collect_demo_bucket(
         "accept_outcomes": list(bucket.accept_outcomes) if bucket.accept_outcomes else "all",
         "outcomes": outcomes,
         "accepted_outcomes": accepted_outcomes,
+        "branches": branches,
+        "accepted_branches": accepted_branches,
         "accepted_families": accepted_families,
         "accepted_poses": accepted_poses,
     }
