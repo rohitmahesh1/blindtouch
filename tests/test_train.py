@@ -61,10 +61,16 @@ def test_training_contract_uses_stacked_touch_observations_for_both_algorithms()
     assert conservative["target_kl"] == pytest.approx(0.02)
     delayed_sac = algorithm_hyperparameters(
         "sac",
-        TrainingConfig("sac", learning_rate=5e-5, sac_learning_starts=20_000),
+        TrainingConfig(
+            "sac",
+            learning_rate=5e-5,
+            sac_learning_starts=20_000,
+            sac_ent_coef=0.01,
+        ),
     )
     assert delayed_sac["learning_rate"] == pytest.approx(5e-5)
     assert delayed_sac["learning_starts"] == 20_000
+    assert delayed_sac["ent_coef"] == pytest.approx(0.01)
     env.close()
 
 
@@ -261,6 +267,8 @@ def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
         TrainingConfig("ppo", ppo_target_kl=0.0)
     with pytest.raises(ValueError, match="sac_learning_starts"):
         TrainingConfig("sac", sac_learning_starts=-1)
+    with pytest.raises(ValueError, match="sac_ent_coef"):
+        TrainingConfig("sac", sac_ent_coef=0.0)
 
 
 def test_warm_start_teacher_validation_gate_uses_procedural_summary(monkeypatch) -> None:
