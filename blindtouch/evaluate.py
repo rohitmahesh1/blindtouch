@@ -32,7 +32,6 @@ from .objects import (
     EpisodeObject,
     SamplingConfig,
     episode_object_from_mapping,
-    get_demo_object,
     sample_training_object,
 )
 
@@ -40,16 +39,13 @@ from .objects import (
 SUITE_SIZES = {
     "validation_interp": 300,
     "test_pose": 200,
-    "test_household": 160,
     "test_stress": 100,
 }
 SUITE_SEED_OFFSETS = {
     "validation_interp": 10_000,
     "test_pose": 20_000,
-    "test_household": 30_000,
     "test_stress": 40_000,
 }
-HOUSEHOLD_NAMES = ("orange", "toy_car", "soap_bar", "tomato")
 BASELINE_ENV_CONFIG = EnvConfig(exploration_steps=0, max_episode_steps=120)
 REPORT_FIELDS = (
     "controller",
@@ -171,12 +167,6 @@ class ReplayResult:
     video_path: Path | None
 
 
-def demo_case(name: str, pose: str | None = None, *, seed: int = 50_000) -> EvaluationCase:
-    """Create a deterministic named-object case for demonstration rendering."""
-
-    return EvaluationCase("demo", seed, get_demo_object(name, pose))
-
-
 def public_controller_info(info: Mapping[str, Any]) -> dict[str, Any]:
     """Expose only timing/outcome state to ordinary scripted or learned policies."""
 
@@ -198,7 +188,6 @@ def build_locked_suite(name: str, *, limit: int | None = None) -> EvaluationSuit
     builder = {
         "validation_interp": _validation_case,
         "test_pose": _pose_case,
-        "test_household": _household_case,
         "test_stress": _stress_case,
     }[name]
     return EvaluationSuite(name=name, cases=tuple(builder(index) for index in range(count)))
@@ -922,26 +911,6 @@ def _pose_case(index: int) -> EvaluationCase:
     return EvaluationCase("test_pose", seed, _replace_pose(sampled, pose))
 
 
-def _household_case(index: int) -> EvaluationCase:
-    seed = SUITE_SEED_OFFSETS["test_household"] + index
-    name = HOUSEHOLD_NAMES[index // 40]
-    base = get_demo_object(name)
-    rng = np.random.default_rng(seed)
-    yaw = float(rng.uniform(-0.20, 0.20))
-    episode_object = replace(
-        base,
-        quaternion=_apply_yaw(base.quaternion, yaw),
-        mass=base.mass * float(rng.uniform(0.92, 1.08)),
-        friction=base.friction * float(rng.uniform(0.92, 1.08)),
-        safe_force=base.safe_force * float(rng.uniform(0.97, 1.03)),
-        x_offset=float(rng.uniform(-0.003, 0.003)),
-        y_offset=float(rng.uniform(-0.003, 0.003)),
-        yaw=yaw,
-        evaluation_tags=base.evaluation_tags + ("perturbed",),
-    )
-    return EvaluationCase("test_household", seed, episode_object)
-
-
 def _stress_case(index: int) -> EvaluationCase:
     seed = SUITE_SEED_OFFSETS["test_stress"] + index
     rng = np.random.default_rng(seed)
@@ -1006,7 +975,7 @@ def _apply_yaw(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run deterministic BlindTouch evaluation.")
-    parser.add_argument("--suite", choices=tuple(SUITE_SIZES), default="test_household")
+    parser.add_argument("--suite", choices=tuple(SUITE_SIZES), default="validation_interp")
     parser.add_argument(
         "--feasibility",
         action="store_true",
@@ -1017,12 +986,6 @@ def main() -> None:
         action="store_true",
         help="Use the declared finite privileged trajectory set with --feasibility.",
     )
-    parser.add_argument(
-        "--render-demo",
-        choices=HOUSEHOLD_NAMES,
-        help="Render one nominal household-object episode instead of a suite report.",
-    )
-    parser.add_argument("--pose", help="Named pose for --render-demo, when supported.")
     parser.add_argument("--camera", choices=("overview", "closeup"), default="overview")
     parser.add_argument(
         "--controller",
@@ -1057,24 +1020,6 @@ def main() -> None:
             f"and {grouped_path}: {dict(outcomes)}"
         )
         return
-    if args.render_demo:
-        result = render_replay(
-            factories[args.controller],
-            demo_case(args.render_demo, args.pose),
-            controller_name=args.controller,
-            checkpoint=args.checkpoint,
-            output_dir=args.output_dir,
-            privileged_controller=privileged_controller,
-            camera_name=args.camera,
-            encode_video=not args.frames_only,
-        )
-        artifact = result.video_path or result.frame_directory
-        print(
-            f"Rendered {result.frame_count} frames to {artifact}: "
-            f"{result.record['outcome']} peak_force={result.record['peak_force']:.3f}"
-        )
-        return
-
     suite = build_locked_suite(args.suite, limit=args.limit)
     records = run_evaluation(
         factories[args.controller],
@@ -1098,7 +1043,6 @@ __all__ = [
     "BASELINE_ENV_CONFIG",
     "EvaluationCase",
     "EvaluationSuite",
-    "HOUSEHOLD_NAMES",
     "FEASIBILITY_REPORT_FIELDS",
     "FEASIBILITY_TRAJECTORY_PLANS",
     "REPORT_FIELDS",
@@ -1106,7 +1050,6 @@ __all__ = [
     "SUITE_SIZES",
     "add_overlay",
     "build_locked_suite",
-    "demo_case",
     "encode_frame_sequence",
     "group_feasibility_failures",
     "public_controller_info",

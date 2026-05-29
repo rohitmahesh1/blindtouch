@@ -117,7 +117,15 @@ def test_supported_shapes_reset_and_training_randomization_is_feasible() -> None
 
 def test_chassis_enables_compound_contact_geometry_only_for_that_family() -> None:
     env = BlindTouchEnv()
-    _, car_info = env.reset(options={"demo_object": "toy_car"})
+    chassis_object = {
+        **FIXED_OBJECT,
+        "shape": "chassis",
+        "pose": "wheels_down",
+        "half_size_x": 0.0375,
+        "half_size_y": 0.0225,
+        "half_size_z": 0.0175,
+    }
+    _, car_info = env.reset(options={"object_params": chassis_object})
     assert car_info["object_params"]["shape"] == "chassis"
     assert all(env.model.geom_contype[geom_id] == 4 for geom_id in env._compound_geom_ids.values())
     close = np.array([0.0, 1.0, 1.0, 1.0], dtype=np.float32)

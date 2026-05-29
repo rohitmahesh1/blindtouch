@@ -101,10 +101,7 @@ SIDE_Y = StablePose(
     (float(np.cos(np.pi / 4.0)), float(np.sin(np.pi / 4.0)), 0.0, 0.0),
     "y",
 )
-ORIENTATION_FREE = StablePose("orientation_free", (1.0, 0.0, 0.0, 0.0), "z")
 WHEELS_DOWN = StablePose("wheels_down", (1.0, 0.0, 0.0, 0.0), "z", (-0.35, 0.35))
-EDGE_RESTING = StablePose("edge_resting", SIDE_Y.quaternion, "y", (-0.7, 0.7))
-CAR_SIDE_RESTING = StablePose("side_resting", SIDE_Y.quaternion, "y", (-0.25, 0.25))
 
 
 TRAINING_FAMILIES: dict[str, ObjectFamily] = {
@@ -160,148 +157,6 @@ TRAINING_FAMILIES: dict[str, ObjectFamily] = {
         stable_poses=(WHEELS_DOWN,),
         evaluation_tags=("training", "compound"),
     )
-}
-
-
-DEMO_OBJECT_POSES: dict[str, dict[str, EpisodeObject]] = {
-    "orange": {
-        "orientation_free": EpisodeObject(
-        family="household",
-        name="orange",
-        shape="ellipsoid",
-        pose="orientation_free",
-        quaternion=ORIENTATION_FREE.quaternion,
-        half_size_x=0.031,
-        half_size_y=0.031,
-        half_size_z=0.031,
-        mass=0.120,
-        friction=0.69,
-        safe_force=0.92,
-        x_offset=0.0,
-        y_offset=0.0,
-        yaw=0.0,
-        resting_half_height=0.031,
-        grasp_height=0.031,
-        visual_style="orange",
-        evaluation_tags=("demo", "held_out", "gentle"),
-        )
-    },
-    "soap_bar": {
-        "broad_face": EpisodeObject(
-        family="household",
-        name="soap_bar",
-        shape="box",
-        pose="broad_face",
-        quaternion=UPRIGHT.quaternion,
-        half_size_x=0.0325,
-        half_size_y=0.021,
-        half_size_z=0.0125,
-        mass=0.095,
-        friction=0.22,
-        safe_force=2.00,
-        x_offset=0.0,
-        y_offset=0.0,
-        yaw=0.0,
-        resting_half_height=0.0125,
-        grasp_height=0.020,
-        visual_style="soap_bar",
-        evaluation_tags=("demo", "held_out", "slippery"),
-        ),
-        "edge_resting": EpisodeObject(
-            family="household",
-            name="soap_bar",
-            shape="box",
-            pose="edge_resting",
-            quaternion=EDGE_RESTING.quaternion,
-            half_size_x=0.0325,
-            half_size_y=0.021,
-            half_size_z=0.0125,
-            mass=0.095,
-            friction=0.22,
-            safe_force=2.00,
-            x_offset=0.0,
-            y_offset=0.0,
-            yaw=0.0,
-            resting_half_height=0.021,
-            grasp_height=0.021,
-            visual_style="soap_bar",
-            evaluation_tags=("demo", "held_out", "slippery", "alternate_pose"),
-        ),
-    },
-    "tomato": {
-        "orientation_free": EpisodeObject(
-        family="household",
-        name="tomato",
-        shape="ellipsoid",
-        pose="orientation_free",
-        quaternion=ORIENTATION_FREE.quaternion,
-        half_size_x=0.030,
-        half_size_y=0.030,
-        half_size_z=0.028,
-        mass=0.100,
-        friction=0.80,
-        safe_force=0.55,
-        x_offset=0.0,
-        y_offset=0.0,
-        yaw=0.0,
-        resting_half_height=0.028,
-        grasp_height=0.028,
-        visual_style="tomato",
-        evaluation_tags=("demo", "held_out", "fragile"),
-        )
-    },
-    "toy_car": {
-        "wheels_down": EpisodeObject(
-        family="household",
-        name="toy_car",
-        shape="chassis",
-        pose="wheels_down",
-        quaternion=WHEELS_DOWN.quaternion,
-        half_size_x=0.0375,
-        half_size_y=0.0225,
-        half_size_z=0.0175,
-        mass=0.090,
-        friction=0.55,
-        safe_force=1.80,
-        x_offset=0.0,
-        y_offset=0.0,
-        yaw=0.0,
-        resting_half_height=0.0175,
-        grasp_height=0.022,
-        visual_style="toy_car",
-        evaluation_tags=("demo", "held_out", "compound_collision"),
-        ),
-        "side_resting": EpisodeObject(
-            family="household",
-            name="toy_car",
-            shape="chassis",
-            pose="side_resting",
-            quaternion=CAR_SIDE_RESTING.quaternion,
-            half_size_x=0.0375,
-            half_size_y=0.0225,
-            half_size_z=0.0175,
-            mass=0.090,
-            friction=0.55,
-            safe_force=1.80,
-            x_offset=0.0,
-            y_offset=0.0,
-            yaw=0.0,
-            resting_half_height=0.0225,
-            grasp_height=0.0225,
-            visual_style="toy_car",
-            evaluation_tags=("demo", "held_out", "compound_collision", "alternate_pose"),
-        ),
-    },
-}
-
-DEMO_DEFAULT_POSES = {
-    "orange": "orientation_free",
-    "soap_bar": "broad_face",
-    "tomato": "orientation_free",
-    "toy_car": "wheels_down",
-}
-DEMO_PROXIES = {
-    name: DEMO_OBJECT_POSES[name][pose] for name, pose in DEMO_DEFAULT_POSES.items()
 }
 
 
@@ -364,26 +219,6 @@ def sample_training_object(
         visual_style=family.visual_style,
         evaluation_tags=family.evaluation_tags,
     )
-
-
-def get_demo_object(name: str, pose: str | None = None) -> EpisodeObject:
-    """Return a held-out household object in a deterministic stable pose."""
-
-    if name not in DEMO_OBJECT_POSES:
-        raise ValueError(f"Unknown demo object: {name!r}")
-    selected_pose = pose or DEMO_DEFAULT_POSES[name]
-    if selected_pose not in DEMO_OBJECT_POSES[name]:
-        valid = tuple(DEMO_OBJECT_POSES[name])
-        raise ValueError(f"Object {name!r} does not support pose {selected_pose!r}; valid poses: {valid}")
-    return DEMO_OBJECT_POSES[name][selected_pose]
-
-
-def demo_object_poses(name: str) -> tuple[str, ...]:
-    """List the deterministic stable poses available for a named demo object."""
-
-    if name not in DEMO_OBJECT_POSES:
-        raise ValueError(f"Unknown demo object: {name!r}")
-    return tuple(DEMO_OBJECT_POSES[name])
 
 
 def episode_object_from_mapping(values: Mapping[str, object]) -> EpisodeObject:
@@ -504,16 +339,11 @@ def _quaternion_multiply(first: Quaternion, second: Quaternion) -> Quaternion:
 
 
 __all__ = [
-    "DEMO_PROXIES",
-    "DEMO_DEFAULT_POSES",
-    "DEMO_OBJECT_POSES",
     "EpisodeObject",
     "ObjectFamily",
     "SamplingConfig",
     "StablePose",
     "TRAINING_FAMILIES",
-    "demo_object_poses",
     "episode_object_from_mapping",
-    "get_demo_object",
     "sample_training_object",
 ]

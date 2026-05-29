@@ -21,12 +21,8 @@ from numpy.typing import NDArray
 from .controllers import per_finger_max_taxel_force
 from .env import BlindTouchEnv, EnvConfig, ObservationHistory
 from .evaluate import (
-    HOUSEHOLD_NAMES,
     EvaluationSuite,
-    ReplayResult,
     build_locked_suite,
-    demo_case,
-    render_replay,
     run_evaluation,
     write_csv_report,
     write_jsonl_report,
@@ -241,8 +237,8 @@ class _SequenceContinuation:
         return np.array([self.lift_rate, 0.0, 0.0, 0.0], dtype=np.float32)
 
 
-class _TomatoBalancedContinuation:
-    """Low-force per-finger balancing branch from the household teacher sweep."""
+class _FragileBalancedContinuation:
+    """Low-force per-finger balancing branch for fragile tactile modes."""
 
     def __init__(self) -> None:
         self.acquire_step = 0
@@ -266,7 +262,7 @@ class _TomatoBalancedContinuation:
 
 
 class _ComposedTouchTeacher:
-    """Touch-only household teacher used for behavior-cloning warm starts.
+    """Touch-only mode teacher used for behavior-cloning warm starts.
 
     The branch names are mnemonic labels for action families; this teacher does
     not read object names, masses, friction, safe-force limits, or diagnostics.
@@ -299,27 +295,27 @@ class _ComposedTouchTeacher:
 
     def _make_continuation(self) -> Any:
         spent_budget = COMPOSED_TEACHER_PROBE_RATE * self.step
-        if self.selected_branch == "orange":
+        if self.selected_branch == "round_retention":
             return _BudgetContinuation(
                 phases=((0.26, 63),),
                 lift_rate=0.70,
                 spent_budget=spent_budget,
             )
-        if self.selected_branch == "toy_car":
+        if self.selected_branch == "rigid_asymmetric":
             return _BudgetContinuation(
                 phases=((0.20, 80),),
                 lift_rate=0.70,
                 spent_budget=spent_budget,
             )
-        if self.selected_branch == "soap_bar":
+        if self.selected_branch == "slippery_retention":
             return _SequenceContinuation(close_rate=0.10, close_steps=24, lift_rate=0.35)
-        if self.selected_branch == "tomato":
-            return _TomatoBalancedContinuation()
+        if self.selected_branch == "fragile_balance":
+            return _FragileBalancedContinuation()
         raise AssertionError(self.selected_branch)
 
     def _select_branch(self) -> str:
         if self.first_contact_step is None:
-            return "orange"
+            return "round_retention"
         first_contact = self.first_contact_step
         final_contacts = int(np.count_nonzero(self.final_forces >= WARM_START_CONTACT_THRESHOLD))
         force_spread = float(np.ptp(self.final_forces))
@@ -328,14 +324,14 @@ class _ComposedTouchTeacher:
                 self.max_force_seen >= COMPOSED_TEACHER_HIGH_FORCE
                 or final_contacts >= COMPOSED_TEACHER_MANY_CONTACTS
             ):
-                return "orange"
-            return "tomato"
+                return "round_retention"
+            return "fragile_balance"
         if (
             self.max_force_seen >= COMPOSED_TEACHER_HIGH_FORCE
             or force_spread >= COMPOSED_TEACHER_SPREAD_THRESHOLD
         ):
-            return "toy_car"
-        return "soap_bar"
+            return "rigid_asymmetric"
+        return "slippery_retention"
 
     def _probe_complete(self) -> bool:
         if self.step >= COMPOSED_TEACHER_PROBE_STEPS:
@@ -471,79 +467,6 @@ def evaluate_policy(
         write_csv_report(records, output_prefix.with_suffix(".csv"))
         write_jsonl_report(records, output_prefix.with_suffix(".jsonl"))
     return records
-
-
-def render_learned_policy_replay(
-    model: PredictivePolicy,
-    *,
-    algorithm: AlgorithmName,
-    checkpoint: str | Path,
-    object_name: str = "orange",
-    pose: str | None = None,
-    output_dir: str | Path = Path("renders/policies"),
-    history_length: int = ObservationHistory.DEFAULT_HISTORY_LENGTH,
-    deterministic: bool = True,
-    env_config: EnvConfig = POLICY_ENV_CONFIG,
-    camera_name: str = "overview",
-    width: int = 1280,
-    height: int = 720,
-    fps: int = 25,
-    encode_video: bool = True,
-) -> ReplayResult:
-    """Render one household-object replay for a loaded stacked-observation policy."""
-
-    return render_replay(
-        lambda: StackedPolicyController(
-            model, history_length=history_length, deterministic=deterministic
-        ),
-        demo_case(object_name, pose),
-        controller_name=algorithm,
-        checkpoint=str(checkpoint),
-        output_dir=output_dir,
-        env_config=env_config,
-        camera_name=camera_name,
-        width=width,
-        height=height,
-        fps=fps,
-        encode_video=encode_video,
-    )
-
-
-def render_policy_checkpoint(
-    *,
-    algorithm: AlgorithmName,
-    checkpoint: str | Path,
-    object_name: str = "orange",
-    pose: str | None = None,
-    output_dir: str | Path = Path("renders/policies"),
-    history_length: int = ObservationHistory.DEFAULT_HISTORY_LENGTH,
-    device: str = "auto",
-    deterministic: bool = True,
-    camera_name: str = "overview",
-    width: int = 1280,
-    height: int = 720,
-    fps: int = 25,
-    encode_video: bool = True,
-) -> ReplayResult:
-    """Load an SB3 checkpoint and render one deterministic learned-policy replay."""
-
-    model_class = _load_algorithms()[algorithm]
-    loaded_model = model_class.load(str(checkpoint), device=device)
-    return render_learned_policy_replay(
-        loaded_model,
-        algorithm=algorithm,
-        checkpoint=checkpoint,
-        object_name=object_name,
-        pose=pose,
-        output_dir=output_dir,
-        history_length=history_length,
-        deterministic=deterministic,
-        camera_name=camera_name,
-        width=width,
-        height=height,
-        fps=fps,
-        encode_video=encode_video,
-    )
 
 
 def build_model(config: TrainingConfig, env: ObservationHistory) -> Any:
@@ -1036,23 +959,6 @@ def main() -> None:
     parser.add_argument("--tensorboard-root", type=Path, default=Path("runs/tensorboard"))
     parser.add_argument("--device", default="auto")
     parser.add_argument(
-        "--render-demo",
-        choices=HOUSEHOLD_NAMES,
-        help="After training each selected algorithm, render its best checkpoint on this demo object.",
-    )
-    parser.add_argument("--render-pose", help="Named pose for --render-demo, when supported.")
-    parser.add_argument("--render-output-dir", type=Path, default=Path("renders/policies"))
-    parser.add_argument("--camera", choices=("overview", "closeup"), default="overview")
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
-    parser.add_argument("--fps", type=int, default=25)
-    parser.add_argument("--frames-only", action="store_true", help="Skip MP4 encoding for replays.")
-    parser.add_argument(
-        "--render-checkpoint",
-        type=Path,
-        help="Load and render an existing checkpoint instead of training.",
-    )
-    parser.add_argument(
         "--allow-uncertified-environment",
         action="store_true",
         help="Acknowledge the failing oracle feasibility gate for an intentional dry run.",
@@ -1102,30 +1008,6 @@ def main() -> None:
     args = parser.parse_args()
 
     selected = ("ppo", "sac") if args.algorithm == "both" else (args.algorithm,)
-    if args.render_checkpoint is not None:
-        if args.algorithm == "both":
-            parser.error("--render-checkpoint requires --algorithm ppo or --algorithm sac")
-        replay = render_policy_checkpoint(
-            algorithm=args.algorithm,
-            checkpoint=args.render_checkpoint,
-            object_name=args.render_demo or "orange",
-            pose=args.render_pose,
-            output_dir=args.render_output_dir,
-            device=args.device,
-            camera_name=args.camera,
-            width=args.width,
-            height=args.height,
-            fps=args.fps,
-            encode_video=not args.frames_only,
-        )
-        artifact = replay.video_path or replay.frame_directory
-        print(
-            f"Rendered {args.algorithm.upper()} replay with {replay.frame_count} frames to "
-            f"{artifact}: {replay.record['outcome']} "
-            f"peak_force={replay.record['peak_force']:.3f}"
-        )
-        return
-
     for algorithm in selected:
         result = train(
             TrainingConfig(
@@ -1154,27 +1036,6 @@ def main() -> None:
             f"best validation safe-success={result.best_safe_success_rate:.3f}; "
             f"checkpoint={result.best_checkpoint}"
         )
-        if args.render_demo:
-            replay = render_policy_checkpoint(
-                algorithm=algorithm,
-                checkpoint=result.best_checkpoint,
-                object_name=args.render_demo,
-                pose=args.render_pose,
-                output_dir=args.render_output_dir,
-                device=args.device,
-                camera_name=args.camera,
-                width=args.width,
-                height=args.height,
-                fps=args.fps,
-                encode_video=not args.frames_only,
-            )
-            artifact = replay.video_path or replay.frame_directory
-            print(
-                f"Rendered {algorithm.upper()} replay with {replay.frame_count} frames to "
-                f"{artifact}: {replay.record['outcome']} "
-                f"peak_force={replay.record['peak_force']:.3f}"
-            )
-
 
 if __name__ == "__main__":
     main()
@@ -1191,8 +1052,6 @@ __all__ = [
     "curriculum_sampling_config",
     "evaluate_policy",
     "make_training_env",
-    "render_learned_policy_replay",
-    "render_policy_checkpoint",
     "require_feasibility_acknowledgement",
     "train",
     "warm_start_from_safe_force_controller",

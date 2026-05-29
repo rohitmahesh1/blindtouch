@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 
 from blindtouch.env import EnvConfig
-from blindtouch.evaluate import EvaluationSuite, ReplayResult, demo_case
+from blindtouch.evaluate import EvaluationCase, EvaluationSuite
+from blindtouch.objects import episode_object_from_mapping
 import blindtouch.train as train_module
 from blindtouch.train import (
     FEASIBILITY_GATE_MESSAGE,
@@ -12,7 +13,6 @@ from blindtouch.train import (
     curriculum_sampling_config,
     evaluate_policy,
     make_training_env,
-    render_learned_policy_replay,
     require_feasibility_acknowledgement,
 )
 
@@ -236,18 +236,38 @@ def test_composed_touch_teacher_starts_from_policy_observation_history() -> None
     for _ in range(3):
         action = teacher.act(contacted.reshape(-1))
     assert action[0] >= 0.0
-    assert teacher.selected_branch in {"orange", "toy_car", "soap_bar", "tomato"}
+    assert teacher.selected_branch in {
+        "round_retention",
+        "rigid_asymmetric",
+        "slippery_retention",
+        "fragile_balance",
+    }
 
 
 def test_learned_policy_evaluation_uses_360_values_and_writes_reports(tmp_path) -> None:
     policy = RecordingPolicy()
-    suite = EvaluationSuite("demo", (demo_case("orange"),))
+    episode_object = episode_object_from_mapping(
+        {
+            "shape": "cylinder",
+            "half_size_x": 0.024,
+            "half_size_y": 0.024,
+            "half_size_z": 0.030,
+            "mass": 0.10,
+            "friction": 1.0,
+            "safe_force": 1.0,
+            "x_offset": 0.0,
+            "y_offset": 0.0,
+            "yaw": 0.0,
+            "name": "reference_object",
+        }
+    )
+    suite = EvaluationSuite("reference", (EvaluationCase("reference", 50_000, episode_object),))
     records = evaluate_policy(
         policy,
         suite,
         algorithm="ppo",
         checkpoint="dry.zip",
-        output_prefix=tmp_path / "ppo_demo",
+        output_prefix=tmp_path / "ppo_reference",
         env_config=EnvConfig(exploration_steps=0, max_episode_steps=2),
     )
 
@@ -256,50 +276,5 @@ def test_learned_policy_evaluation_uses_360_values_and_writes_reports(tmp_path) 
     assert records[0]["outcome"] == "timeout"
     assert policy.observations
     assert all(observation.shape == (360,) for observation in policy.observations)
-    assert (tmp_path / "ppo_demo.csv").exists()
-    assert (tmp_path / "ppo_demo.jsonl").exists()
-
-
-def test_learned_policy_replay_uses_loaded_policy_history_and_writes_frames(
-    tmp_path, monkeypatch
-) -> None:
-    policy = RecordingPolicy()
-
-    def fake_render_replay(controller_factory, case, **kwargs):
-        controller = controller_factory()
-        observation = np.arange(45, dtype=np.float32) / 100.0
-        controller.reset(observation, {})
-        action = controller.act(observation, {})
-        np.testing.assert_array_equal(action, np.zeros(4, dtype=np.float32))
-        assert case.object.name == "orange"
-        assert kwargs["controller_name"] == "ppo"
-        assert kwargs["checkpoint"] == "dry.zip"
-        assert kwargs["output_dir"] == tmp_path
-        return ReplayResult(
-            {"controller": "ppo", "checkpoint": "dry.zip", "object_name": "orange"},
-            3,
-            tmp_path / "orange_ppo_overview_frames",
-            None,
-        )
-
-    monkeypatch.setattr(train_module, "render_replay", fake_render_replay)
-    result = render_learned_policy_replay(
-        policy,
-        algorithm="ppo",
-        checkpoint="dry.zip",
-        object_name="orange",
-        output_dir=tmp_path,
-        env_config=EnvConfig(exploration_steps=0, max_episode_steps=2),
-        width=160,
-        height=120,
-        encode_video=False,
-    )
-
-    assert result.record["controller"] == "ppo"
-    assert result.record["checkpoint"] == "dry.zip"
-    assert result.record["object_name"] == "orange"
-    assert result.frame_count > 0
-    assert result.video_path is None
-    assert result.frame_directory == tmp_path / "orange_ppo_overview_frames"
-    assert policy.observations
-    assert all(observation.shape == (360,) for observation in policy.observations)
+    assert (tmp_path / "ppo_reference.csv").exists()
+    assert (tmp_path / "ppo_reference.jsonl").exists()

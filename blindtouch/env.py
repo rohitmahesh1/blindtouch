@@ -18,7 +18,6 @@ from .objects import (
     EpisodeObject,
     SamplingConfig,
     episode_object_from_mapping,
-    get_demo_object,
     sample_training_object,
 )
 
@@ -166,49 +165,16 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
                 "object_wheel_rr_geom",
             )
         }
-        self._accent_geom_ids = tuple(
-            self.model.geom(name).id
-            for name in (
-                "object_accent_1_geom",
-                "object_accent_2_geom",
-                "object_accent_3_geom",
-                "object_accent_4_geom",
-                "object_accent_5_geom",
-                "object_accent_6_geom",
-                "object_accent_7_geom",
-                "object_accent_8_geom",
-                "object_accent_9_geom",
-                "object_accent_10_geom",
-            )
-        )
         self._mutable_object_geom_ids = (
             self._object_geom_id,
             *self._compound_geom_ids.values(),
-            *self._accent_geom_ids,
         )
         for geom_id in self._mutable_object_geom_ids:
             # MuJoCo optimizes XML geoms at identity as body-frame geoms. These
             # placeholders are repositioned at reset time, so keep their local
             # transforms active.
             self.model.geom_sameframe[geom_id] = int(mujoco.mjtSameFrame.mjSAMEFRAME_NONE)
-        self._material_ids = {
-            name: self.model.material(name).id
-            for name in (
-                "object",
-                "orange_skin",
-                "fruit_leaf",
-                "tomato_skin",
-                "soap_body",
-                "soap_stamp",
-                "car_body",
-                "car_window",
-                "car_tire",
-                "car_lamp",
-                "car_tail_lamp",
-                "car_racing_stripe",
-                "car_hubcap",
-            )
-        }
+        self._material_ids = {"object": self.model.material("object").id}
         self._pad_geom_ids = np.array(
             [self.model.geom(f"finger_{finger}_pad").id for finger in range(1, 4)],
             dtype=np.int32,
@@ -269,9 +235,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
 
         super().reset(seed=seed)
         episode_options = options or {}
-        randomized_reset = not any(
-            key in episode_options for key in ("object", "object_params", "demo_object")
-        )
+        randomized_reset = not any(key in episode_options for key in ("object", "object_params"))
         self._rejected_reset_samples = 0
         for _ in range(self.config.max_reset_attempts):
             mujoco.mj_resetData(self.model, self.data)
@@ -475,8 +439,6 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             if not isinstance(provided_object, EpisodeObject):
                 raise TypeError("options['object'] must be an EpisodeObject")
             return provided_object
-        if "demo_object" in options:
-            return get_demo_object(str(options["demo_object"]), options.get("pose"))
         if "object_params" in options:
             provided_params = options["object_params"]
             if not isinstance(provided_params, Mapping):
@@ -600,173 +562,13 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             self.model.geom_conaffinity[pad_id] = 4
 
     def _configure_visual_geometry(self, params: EpisodeObject) -> None:
+        del params
         self._show_material(self._object_geom_id, "object")
-        for geom_id in self._accent_geom_ids:
-            self.model.geom_matid[geom_id] = -1
-            self.model.geom_rgba[geom_id] = (0.0, 0.0, 0.0, 0.0)
-            self.model.geom_pos[geom_id] = (0.0, 0.0, 0.0)
-            self.model.geom_quat[geom_id] = (1.0, 0.0, 0.0, 0.0)
-
-        if params.visual_style == "orange":
-            self._show_material(self._object_geom_id, "orange_skin")
-            self._set_accent(
-                0,
-                geom_type=mujoco.mjtGeom.mjGEOM_CYLINDER,
-                size=(0.002, 0.004, 0.0),
-                position=(0.0, 0.0, params.half_size_z + 0.003),
-                material="fruit_leaf",
-            )
-            self._set_accent(
-                1,
-                geom_type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
-                size=(0.006, 0.003, 0.001),
-                position=(0.004, 0.0, params.half_size_z + 0.005),
-                material="fruit_leaf",
-            )
-        elif params.visual_style == "tomato":
-            self._show_material(self._object_geom_id, "tomato_skin")
-            self._set_accent(
-                0,
-                geom_type=mujoco.mjtGeom.mjGEOM_CYLINDER,
-                size=(0.0015, 0.003, 0.0),
-                position=(0.0, 0.0, params.half_size_z + 0.002),
-                material="fruit_leaf",
-            )
-            self._set_accent(
-                1,
-                geom_type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
-                size=(0.009, 0.0035, 0.001),
-                position=(0.002, 0.0, params.half_size_z + 0.002),
-                material="fruit_leaf",
-            )
-        elif params.visual_style == "soap_bar":
-            self.model.geom_matid[self._object_geom_id] = -1
-            self.model.geom_rgba[self._object_geom_id] = (0.0, 0.0, 0.0, 0.0)
-            self._set_accent(
-                0,
-                geom_type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
-                size=(params.half_size_x, params.half_size_y, params.half_size_z),
-                position=(0.0, 0.0, 0.0),
-                material="soap_body",
-            )
-            self._set_accent(
-                1,
-                geom_type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
-                size=(0.012, 0.007, 0.0008),
-                position=(0.0, 0.0, params.half_size_z + 0.0007),
-                material="soap_stamp",
-            )
-        elif params.visual_style == "toy_car":
-            self._show_material(self._object_geom_id, "car_body")
-            self._show_material(self._compound_geom_ids["object_cabin_geom"], "car_window")
-            for name in (
-                "object_wheel_fl_geom",
-                "object_wheel_fr_geom",
-                "object_wheel_rl_geom",
-                "object_wheel_rr_geom",
-            ):
-                self._show_material(self._compound_geom_ids[name], "car_tire")
-            body_top_z = (
-                self.model.geom_pos[self._object_geom_id, 2]
-                + self.model.geom_size[self._object_geom_id, 2]
-            )
-            cabin_top_z = (
-                self.model.geom_pos[self._compound_geom_ids["object_cabin_geom"], 2]
-                + self.model.geom_size[self._compound_geom_ids["object_cabin_geom"], 2]
-            )
-            lamp_z = body_top_z - 0.002
-            self._set_accent(
-                0,
-                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=(0.0015, 0.0045, 0.0020),
-                position=(params.half_size_x * 0.86, params.half_size_y * 0.42, lamp_z),
-                material="car_lamp",
-            )
-            self._set_accent(
-                1,
-                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=(0.0015, 0.0045, 0.0020),
-                position=(params.half_size_x * 0.86, -params.half_size_y * 0.42, lamp_z),
-                material="car_lamp",
-            )
-            self._set_accent(
-                2,
-                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=(0.0013, 0.0038, 0.0018),
-                position=(-params.half_size_x * 0.86, params.half_size_y * 0.42, lamp_z),
-                material="car_tail_lamp",
-            )
-            self._set_accent(
-                3,
-                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=(0.0013, 0.0038, 0.0018),
-                position=(-params.half_size_x * 0.86, -params.half_size_y * 0.42, lamp_z),
-                material="car_tail_lamp",
-            )
-            self._set_accent(
-                4,
-                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=(0.026, 0.0012, 0.0030),
-                position=(
-                    0.0,
-                    self.model.geom_size[self._object_geom_id, 1] + 0.0012,
-                    self.model.geom_pos[self._object_geom_id, 2] + 0.0010,
-                ),
-                material="car_racing_stripe",
-            )
-            self._set_accent(
-                5,
-                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=(0.026, 0.0012, 0.0030),
-                position=(
-                    0.0,
-                    -self.model.geom_size[self._object_geom_id, 1] - 0.0012,
-                    self.model.geom_pos[self._object_geom_id, 2] + 0.0010,
-                ),
-                material="car_racing_stripe",
-            )
-            for accent_index, wheel_name in enumerate(
-                (
-                    "object_wheel_fl_geom",
-                    "object_wheel_fr_geom",
-                    "object_wheel_rl_geom",
-                    "object_wheel_rr_geom",
-                ),
-                start=6,
-            ):
-                wheel_id = self._compound_geom_ids[wheel_name]
-                position = self.model.geom_pos[wheel_id].copy()
-                side = 1.0 if position[1] >= 0.0 else -1.0
-                wheel_radius = float(self.model.geom_size[wheel_id, 0])
-                position[1] += side * wheel_radius * 0.80
-                self._set_accent(
-                    accent_index,
-                    geom_type=mujoco.mjtGeom.mjGEOM_SPHERE,
-                    size=(wheel_radius * 0.55, 0.0, 0.0),
-                    position=tuple(float(value) for value in position),
-                    material="car_hubcap",
-                )
 
     def _show_material(self, geom_id: int, material: str) -> None:
         material_id = self._material_ids[material]
         self.model.geom_matid[geom_id] = material_id
         self.model.geom_rgba[geom_id] = self.model.mat_rgba[material_id]
-
-    def _set_accent(
-        self,
-        index: int,
-        *,
-        geom_type: mujoco.mjtGeom,
-        size: tuple[float, float, float],
-        position: tuple[float, float, float],
-        material: str,
-    ) -> None:
-        geom_id = self._accent_geom_ids[index]
-        self.model.geom_type[geom_id] = int(geom_type)
-        self.model.geom_size[geom_id] = size
-        self.model.geom_pos[geom_id] = position
-        self.model.geom_rbound[geom_id] = float(np.linalg.norm(size))
-        self._show_material(geom_id, material)
 
     @staticmethod
     def _geom_type(shape: str) -> int:

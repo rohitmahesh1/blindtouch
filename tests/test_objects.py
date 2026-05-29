@@ -5,7 +5,6 @@ from blindtouch.objects import (
     TRAINING_FAMILIES,
     SamplingConfig,
     episode_object_from_mapping,
-    get_demo_object,
     sample_training_object,
 )
 
@@ -90,27 +89,6 @@ def test_sampling_config_can_target_safe_force_headroom() -> None:
                 safe_force_headroom_range=(0.0, 1.0),
             ),
         )
-
-
-def test_demo_objects_lock_household_specs_and_named_poses() -> None:
-    orange = get_demo_object("orange")
-    soap_edge = get_demo_object("soap_bar", "edge_resting")
-    tomato = get_demo_object("tomato")
-    car = get_demo_object("toy_car", "wheels_down")
-
-    assert orange.shape == "ellipsoid"
-    assert orange.mass == pytest.approx(0.120)
-    assert orange.friction == pytest.approx(0.69)
-    assert orange.safe_force == pytest.approx(0.92)
-    assert soap_edge.shape == "box"
-    assert soap_edge.pose == "edge_resting"
-    assert tomato.shape == "ellipsoid"
-    assert tomato.friction == pytest.approx(0.80)
-    assert tomato.safe_force == pytest.approx(0.55)
-    assert car.shape == "chassis"
-    assert "compound_collision" in car.evaluation_tags
-    with pytest.raises(ValueError):
-        get_demo_object("toy_car", "side_x")
 
 
 def test_custom_pose_computes_resting_axis_and_orientation() -> None:

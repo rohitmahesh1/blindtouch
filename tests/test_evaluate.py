@@ -12,7 +12,6 @@ from blindtouch.evaluate import (
     SUITE_SIZES,
     add_overlay,
     build_locked_suite,
-    demo_case,
     group_feasibility_failures,
     public_controller_info,
     run_feasibility_diagnostic,
@@ -83,14 +82,6 @@ def test_locked_suites_have_fixed_sizes_and_reproducible_metadata() -> None:
         case.object.pose in {"side_x", "side_y"} and case.object.family in {"container", "package"}
         for case in pose_cases
     )
-    household_cases = build_locked_suite("test_household").cases
-    assert {case.object.name for case in household_cases} == {
-        "orange",
-        "toy_car",
-        "soap_bar",
-        "tomato",
-    }
-    assert all("perturbed" in case.object.evaluation_tags for case in household_cases)
     assert all(
         "stress" in case.object.evaluation_tags
         for case in build_locked_suite("test_stress").cases
@@ -98,7 +89,7 @@ def test_locked_suites_have_fixed_sizes_and_reproducible_metadata() -> None:
 
 
 def test_scripted_evaluation_reports_are_repeatable_and_complete(tmp_path) -> None:
-    suite = build_locked_suite("test_household", limit=4)
+    suite = build_locked_suite("test_pose", limit=4)
     first = run_evaluation(FixedGripController, suite, controller_name="fixed")
     second = run_evaluation(FixedGripController, suite, controller_name="fixed")
     assert first == second
@@ -114,7 +105,7 @@ def test_scripted_evaluation_reports_are_repeatable_and_complete(tmp_path) -> No
         rows = list(csv.DictReader(report))
     assert tuple(rows[0]) == REPORT_FIELDS
     assert len(rows) == 4
-    assert all(row["suite"] == "test_household" for row in rows)
+    assert all(row["suite"] == "test_pose" for row in rows)
     assert all("object_params" not in row for row in rows)
 
     json_rows = [
@@ -136,17 +127,16 @@ class PublicOnlyController:
 
 def test_evaluator_does_not_supply_hidden_object_or_render_state_to_controller() -> None:
     public = public_controller_info(
-        {"phase": "probe", "step": 1, "outcome": None, "object_params": {"name": "orange"}}
+        {"phase": "probe", "step": 1, "outcome": None, "object_params": {"name": "reference_object"}}
     )
     assert public == {"phase": "probe", "step": 1, "outcome": None}
 
     records = run_evaluation(
         PublicOnlyController,
-        build_locked_suite("test_household", limit=1),
+        build_locked_suite("validation_interp", limit=1),
         controller_name="public_only",
         env_config=EnvConfig(exploration_steps=0, max_episode_steps=2),
     )
-    assert records[0]["object_name"] == "orange"
     assert records[0]["outcome"] == "timeout"
 
 
@@ -158,7 +148,7 @@ def test_overlay_draws_touch_panel_but_hides_object_identity_until_completion() 
         "phase": "explore",
         "pad_forces": np.array([0.2, 0.0, 0.0], dtype=np.float32),
         "peak_pad_force": 0.2,
-        "object_params": {"name": "orange"},
+        "object_params": {"name": "reference_object"},
         "outcome": None,
     }
     hidden = add_overlay(frame, observation, info, reveal_result=False)
@@ -172,7 +162,6 @@ def test_overlay_draws_touch_panel_but_hides_object_identity_until_completion() 
     assert hidden.shape == frame.shape
     assert np.any(hidden != frame)
     assert np.any(hidden != revealed)
-    assert demo_case("orange").object.name == "orange"
 
 
 def test_feasibility_report_preserves_seeded_physics_and_grouped_failures(tmp_path) -> None:

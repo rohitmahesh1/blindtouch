@@ -14,6 +14,20 @@ from blindtouch.controllers import (
 from blindtouch.env import BlindTouchEnv, EnvConfig
 
 
+REFERENCE_OBJECT = {
+    "shape": "cylinder",
+    "half_size_x": 0.024,
+    "half_size_y": 0.024,
+    "half_size_z": 0.030,
+    "mass": 0.10,
+    "friction": 1.0,
+    "safe_force": 2.0,
+    "x_offset": 0.0,
+    "y_offset": 0.0,
+    "yaw": 0.0,
+}
+
+
 class PublicInfo(dict[str, Any]):
     """Fail loudly if a non-oracle controller attempts to inspect hidden state."""
 
@@ -55,29 +69,6 @@ def test_non_oracle_controllers_use_observation_and_internal_timing_only() -> No
             assert action.dtype == np.float32
 
 
-def test_demo_baselines_expose_failures_and_touch_adaptation() -> None:
-    env = BlindTouchEnv(config=EnvConfig(exploration_steps=0, max_episode_steps=120))
-    demo_objects = ("orange", "soap_bar", "tomato", "toy_car")
-
-    fixed_outcomes = [
-        run_episode(env, FixedGripController(), options={"demo_object": name})["outcome"]
-        for name in demo_objects
-    ]
-    threshold_outcomes = [
-        run_episode(env, ThresholdGripController(), options={"demo_object": name})["outcome"]
-        for name in demo_objects
-    ]
-    probe_outcomes = [
-        run_episode(env, ProbeThenLiftController(), options={"demo_object": name})["outcome"]
-        for name in demo_objects
-    ]
-
-    assert "damage" in fixed_outcomes
-    assert any(outcome != "success" for outcome in threshold_outcomes)
-    assert probe_outcomes == ["success"] * len(demo_objects)
-    env.close()
-
-
 def test_safe_force_controller_balances_individual_fingertip_taxels() -> None:
     observation = np.zeros(45, dtype=np.float32)
     controller = SafeForceGripController()
@@ -99,13 +90,14 @@ def test_safe_force_controller_balances_individual_fingertip_taxels() -> None:
     assert action[3] == 0.0
 
 
-def test_oracle_debug_controller_certifies_named_feasible_suite() -> None:
+def test_oracle_debug_controller_can_certify_a_reference_object() -> None:
     env = BlindTouchEnv(config=EnvConfig(exploration_steps=0, max_episode_steps=120))
-    outcomes = [
-        run_episode(env, OracleDebugController(), options={"demo_object": name})["outcome"]
-        for name in ("orange", "soap_bar", "tomato", "toy_car")
-    ]
-    assert outcomes == ["success"] * 4
+    result = run_episode(
+        env,
+        OracleDebugController(scripted_close_phases=((0.70, 30),)),
+        options={"object_params": REFERENCE_OBJECT},
+    )
+    assert result["outcome"] == "success"
     env.close()
 
 

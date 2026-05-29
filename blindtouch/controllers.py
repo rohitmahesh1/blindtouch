@@ -290,32 +290,18 @@ class OracleDebugController:
     _safe_force: float = field(init=False, default=0.0)
     _active_lift_rate: float = field(init=False, default=1.0)
 
-    _DEMO_PHASES = {
-        "orange": ((0.26, 63),),
-        "soap_bar": ((0.20, 84),),
-        "tomato": ((0.40, 38), (0.05, 23)),
-        "toy_car": ((0.20, 80),),
-    }
-    _DEMO_LIFT_RATES = {
-        "orange": 0.70,
-    }
-
     def reset(self, observation: Observation, info: Mapping[str, Any]) -> None:
         del observation
         params = info["object_params"]
-        name = str(params["name"])
         if self.scripted_close_phases is not None:
             self._mode = "scripted"
             self._phases = self.scripted_close_phases
-        elif name in self._DEMO_PHASES:
-            self._mode = "scripted"
-            self._phases = self._DEMO_PHASES[name]
         else:
             self._mode = "force_balance"
             self._phases = ()
         self._safe_force = float(params["safe_force"])
         self._force_target = self._safe_force * 0.55
-        self._active_lift_rate = self._DEMO_LIFT_RATES.get(name, self.lift_rate)
+        self._active_lift_rate = self.lift_rate
         self._stable_steps = 0
         self._lifting = False
         self._step = 0

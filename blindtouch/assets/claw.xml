@@ -61,7 +61,6 @@
     <material name="rail" rgba="0.42 0.48 0.55 1"/>
     <material name="pad" rgba="0.12 0.55 0.70 1"/>
     <material name="object" rgba="0.92 0.60 0.18 1"/>
-    <include file="objects/demo_materials.xml"/>
   </asset>
 
   <worldbody>
@@ -177,27 +176,6 @@
       <geom name="object_wheel_rr_geom" class="object_contact" type="sphere"
             size="0.001" mass="0" contype="0" conaffinity="0"
             rgba="0 0 0 0"/>
-      <!-- Runtime-enabled visual-only decorations for held-out demo objects. -->
-      <geom name="object_accent_1_geom" class="structure" type="sphere"
-            size="0.001" mass="0" rgba="0 0 0 0"/>
-      <geom name="object_accent_2_geom" class="structure" type="sphere"
-            size="0.001" mass="0" rgba="0 0 0 0"/>
-      <geom name="object_accent_3_geom" class="structure" type="sphere"
-            size="0.001" mass="0" rgba="0 0 0 0"/>
-      <geom name="object_accent_4_geom" class="structure" type="sphere"
-            size="0.001" mass="0" rgba="0 0 0 0"/>
-      <geom name="object_accent_5_geom" class="structure" type="sphere"
-            size="0.001" mass="0" rgba="0 0 0 0"/>
-      <geom name="object_accent_6_geom" class="structure" type="sphere"
-            size="0.001" mass="0" rgba="0 0 0 0"/>
-      <geom name="object_accent_7_geom" class="structure" type="sphere"
-            size="0.001" mass="0" rgba="0 0 0 0"/>
-      <geom name="object_accent_8_geom" class="structure" type="sphere"
-            size="0.001" mass="0" rgba="0 0 0 0"/>
-      <geom name="object_accent_9_geom" class="structure" type="sphere"
-            size="0.001" mass="0" rgba="0 0 0 0"/>
-      <geom name="object_accent_10_geom" class="structure" type="sphere"
-            size="0.001" mass="0" rgba="0 0 0 0"/>
       <site name="object_center" type="sphere" size="0.0025"
             rgba="1 1 1 0.65" group="4"/>
     </body>
