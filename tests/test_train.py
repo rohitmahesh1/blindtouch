@@ -244,6 +244,24 @@ def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
             warm_start_profile="fragile_mix",
         )
     ) == ("fragile_upright",)
+    stratified_config = TrainingConfig("ppo", warm_start_profile="stratified_quality")
+    assert train_module._warm_start_curriculum_stages(stratified_config) == ("upright",)
+    buckets = train_module._stratified_quality_demo_buckets(stratified_config)
+    assert [bucket.name for bucket in buckets] == [
+        "stage_core",
+        "fragile_low_margin_success",
+        "slippery_gap_success",
+        "rigid_side_gap_success",
+    ]
+    assert buckets[0].accept_outcomes is None
+    assert all(bucket.accept_outcomes == ("success",) for bucket in buckets[1:])
+    assert sum(bucket.weight for bucket in buckets) == pytest.approx(1.0)
+    assert train_module._transition_quotas(8624, buckets) == {
+        "stage_core": 8195,
+        "fragile_low_margin_success": 146,
+        "slippery_gap_success": 146,
+        "rigid_side_gap_success": 137,
+    }
     with pytest.raises(ValueError, match="Unsupported warm-start teacher"):
         TrainingConfig("ppo", warm_start_teacher="oracle")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="Unsupported warm-start profile"):
