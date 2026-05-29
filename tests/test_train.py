@@ -46,6 +46,24 @@ def test_training_contract_uses_stacked_touch_observations_for_both_algorithms()
     assert sac["buffer_size"] == 1_000_000
     assert sac["learning_starts"] == 10_000
     assert sac["ent_coef"] == "auto"
+    conservative = algorithm_hyperparameters(
+        "ppo",
+        TrainingConfig(
+            "ppo",
+            learning_rate=5e-5,
+            ppo_clip_range=0.05,
+            ppo_target_kl=0.02,
+        ),
+    )
+    assert conservative["learning_rate"] == pytest.approx(5e-5)
+    assert conservative["clip_range"] == pytest.approx(0.05)
+    assert conservative["target_kl"] == pytest.approx(0.02)
+    delayed_sac = algorithm_hyperparameters(
+        "sac",
+        TrainingConfig("sac", learning_rate=5e-5, sac_learning_starts=20_000),
+    )
+    assert delayed_sac["learning_rate"] == pytest.approx(5e-5)
+    assert delayed_sac["learning_starts"] == 20_000
     env.close()
 
 
@@ -185,6 +203,10 @@ def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
     assert TrainingConfig("ppo").warm_start_validation_suite == "validation_procedural"
     assert TrainingConfig("ppo").warm_start_validation_limit == 24
     assert TrainingConfig("ppo").warm_start_min_safe_success_rate == pytest.approx(0.10)
+    assert TrainingConfig("ppo").warm_start_policy_gate_suite == "validation_procedural"
+    assert TrainingConfig("ppo").warm_start_policy_min_safe_success_rate == pytest.approx(0.10)
+    assert TrainingConfig("ppo").rl_regression_tolerance == pytest.approx(0.0)
+    assert TrainingConfig("ppo").stop_on_rl_regression is False
     assert train_module._warm_start_curriculum_stages(TrainingConfig("ppo")) == ("upright",)
     assert train_module._warm_start_curriculum_stages(
         TrainingConfig("ppo", warm_start_profile="fragile_mix")
@@ -206,6 +228,26 @@ def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
         TrainingConfig("ppo", warm_start_validation_limit=0)
     with pytest.raises(ValueError, match="safe_success_rate"):
         TrainingConfig("ppo", warm_start_min_safe_success_rate=1.1)
+    with pytest.raises(ValueError, match="policy gate suite"):
+        TrainingConfig("ppo", warm_start_policy_gate_suite="demo")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="included in evaluation_suites"):
+        TrainingConfig(
+            "ppo",
+            evaluation_suites=("test_procedural_holdout",),
+            warm_start_policy_gate_suite="validation_procedural",
+        )
+    with pytest.raises(ValueError, match="policy_min_safe_success_rate"):
+        TrainingConfig("ppo", warm_start_policy_min_safe_success_rate=1.1)
+    with pytest.raises(ValueError, match="rl_regression_tolerance"):
+        TrainingConfig("ppo", rl_regression_tolerance=-0.1)
+    with pytest.raises(ValueError, match="learning_rate"):
+        TrainingConfig("ppo", learning_rate=0.0)
+    with pytest.raises(ValueError, match="ppo_clip_range"):
+        TrainingConfig("ppo", ppo_clip_range=0.0)
+    with pytest.raises(ValueError, match="ppo_target_kl"):
+        TrainingConfig("ppo", ppo_target_kl=0.0)
+    with pytest.raises(ValueError, match="sac_learning_starts"):
+        TrainingConfig("sac", sac_learning_starts=-1)
 
 
 def test_warm_start_teacher_validation_gate_uses_procedural_summary(monkeypatch) -> None:
@@ -262,6 +304,64 @@ def test_warm_start_teacher_validation_gate_uses_procedural_summary(monkeypatch)
         )
 
 
+def test_warm_start_policy_gate_uses_post_bc_checkpoint_summary() -> None:
+    config = TrainingConfig(
+        "ppo",
+        warm_start_policy_min_safe_success_rate=0.50,
+    )
+    summaries = {
+        "validation_procedural": {
+            "safe_success_rate": 0.50,
+            "failure_modes": {"damage": 1},
+        }
+    }
+
+    summary = train_module.validate_warm_start_policy(summaries, config)
+
+    assert summary["safe_success_rate"] == pytest.approx(0.50)
+    with pytest.raises(RuntimeError, match="post-BC validation gate"):
+        train_module.validate_warm_start_policy(
+            {
+                "validation_procedural": {
+                    "safe_success_rate": 0.25,
+                    "failure_modes": {"drop": 3},
+                }
+            },
+            config,
+        )
+
+
+def test_checkpoint_preservation_report_compares_against_post_bc_score(tmp_path) -> None:
+    config = TrainingConfig("sac", rl_regression_tolerance=0.125)
+
+    preserved = train_module._checkpoint_preservation_record(
+        config,
+        baseline_label="step_0_warm_start",
+        baseline_score=(0.50, -0.80),
+        checkpoint_label="step_10000",
+        checkpoint_score=(0.375, -0.70),
+    )
+    regressed = train_module._checkpoint_preservation_record(
+        config,
+        baseline_label="step_0_warm_start",
+        baseline_score=(0.50, -0.80),
+        checkpoint_label="step_20000",
+        checkpoint_score=(0.25, -0.40),
+    )
+
+    assert preserved["passed"] is True
+    assert preserved["safe_success_delta"] == pytest.approx(-0.125)
+    assert preserved["required_safe_success_rate"] == pytest.approx(0.375)
+    assert preserved["mean_peak_force_delta"] == pytest.approx(-0.10)
+    assert regressed["passed"] is False
+    report = tmp_path / "rl_preservation.jsonl"
+    train_module._append_preservation_record(report, preserved)
+    train_module._append_preservation_record(report, regressed)
+    lines = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
+    assert [line["checkpoint"] for line in lines] == ["step_10000", "step_20000"]
+    assert "regressed" in train_module._preservation_status_message("sac", regressed)
+
+
 def test_checkpoint_evaluation_uses_all_suites_and_promotes_holdout(
     monkeypatch, tmp_path
 ) -> None:
@@ -314,6 +414,7 @@ def test_checkpoint_evaluation_uses_all_suites_and_promotes_holdout(
         tmp_path / "test_procedural_holdout_step_1.csv"
     )
     summary = json.loads(evaluation.summary_path.read_text(encoding="utf-8"))
+    assert evaluation.summaries == summary
     assert summary["validation_procedural"]["failure_modes"] == {"timeout_no_grip": 1}
     assert summary["test_procedural_holdout"]["safe_success_rate"] == pytest.approx(1.0)
     assert train_module._promotion_score(evaluation.records_by_suite, config) == (
