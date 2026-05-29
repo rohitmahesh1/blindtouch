@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -691,6 +692,7 @@ def train(config: TrainingConfig) -> TrainingResult:
     require_feasibility_acknowledgement(
         config.curriculum_stage, config.allow_uncertified_environment
     )
+    _seed_training_rngs(config.seed)
     run_directory = config.output_root / config.run_name
     checkpoint_directory = config.checkpoint_root / config.run_name
     report_directory = run_directory / "evaluation"
@@ -804,6 +806,21 @@ def train(config: TrainingConfig) -> TrainingResult:
         promotion_suite=config.promotion_suite,
         best_safe_success_rate=best_score[0],
     )
+
+
+def _seed_training_rngs(seed: int) -> None:
+    """Reset process-level RNGs so repeated warm-start runs are comparable."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch as th
+    except ImportError:
+        return
+
+    th.manual_seed(seed)
+    if th.cuda.is_available():
+        th.cuda.manual_seed_all(seed)
 
 
 def evaluate_checkpoint(
