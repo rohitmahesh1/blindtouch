@@ -1,4 +1,5 @@
 import json
+import random
 
 import numpy as np
 import pytest
@@ -302,6 +303,43 @@ def test_warm_start_teacher_validation_gate_uses_procedural_summary(monkeypatch)
                 warm_start_min_safe_success_rate=0.75,
             )
         )
+
+
+def test_training_resets_rngs_before_building_environment(monkeypatch, tmp_path) -> None:
+    calls: list[int] = []
+
+    def fake_seed(seed: int) -> None:
+        calls.append(seed)
+
+    def fake_make_training_env(**kwargs):
+        del kwargs
+        assert calls == [17]
+        raise RuntimeError("stop after seed")
+
+    monkeypatch.setattr(train_module, "_seed_training_rngs", fake_seed)
+    monkeypatch.setattr(train_module, "make_training_env", fake_make_training_env)
+
+    with pytest.raises(RuntimeError, match="stop after seed"):
+        train_module.train(
+            TrainingConfig(
+                "ppo",
+                seed=17,
+                output_root=tmp_path / "runs",
+                checkpoint_root=tmp_path / "checkpoints",
+                tensorboard_root=tmp_path / "tensorboard",
+            )
+        )
+
+
+def test_training_rng_seed_is_reproducible() -> None:
+    train_module._seed_training_rngs(23)
+    python_value = random.random()
+    numpy_value = float(np.random.random())
+
+    train_module._seed_training_rngs(23)
+
+    assert random.random() == pytest.approx(python_value)
+    assert float(np.random.random()) == pytest.approx(numpy_value)
 
 
 def test_warm_start_policy_gate_uses_post_bc_checkpoint_summary() -> None:
