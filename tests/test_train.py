@@ -619,6 +619,42 @@ def test_composed_touch_teacher_starts_from_policy_observation_history() -> None
     }
 
 
+def test_composed_touch_teacher_slows_probe_after_contact() -> None:
+    teacher = train_module._ComposedTouchTeacher()
+    contacted = np.zeros((8, 45), dtype=np.float32)
+    contacted[-1, 12] = 0.50 / 5.0
+
+    action = teacher.act(contacted.reshape(-1))
+
+    assert teacher.continuation is None
+    assert action[0] == 0.0
+    assert action[1] < 0.0
+    assert action[2] == pytest.approx(train_module.COMPOSED_TEACHER_CONTACT_PROBE_RATE)
+    assert action[3] == pytest.approx(train_module.COMPOSED_TEACHER_CONTACT_PROBE_RATE)
+
+
+def test_band_balanced_continuation_lifts_after_stable_contact() -> None:
+    continuation = train_module._BandBalancedContinuation(
+        low_force=0.30,
+        high_force=0.48,
+        close_rate=0.06,
+        trim_close_rate=0.04,
+        release_rate=0.08,
+        lift_rate=0.45,
+        stable_steps_required=2,
+        max_acquire_steps=42,
+    )
+    observation = np.zeros(45, dtype=np.float32)
+    observation[12] = 0.34 / 5.0
+    observation[21] = 0.34 / 5.0
+
+    first = continuation.act(observation)
+    second = continuation.act(observation)
+
+    assert first[0] == 0.0
+    assert second[0] == pytest.approx(0.45)
+
+
 def test_learned_policy_evaluation_uses_360_values_and_writes_reports(tmp_path) -> None:
     policy = RecordingPolicy()
     episode_object = episode_object_from_mapping(
