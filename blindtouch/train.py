@@ -9,6 +9,7 @@ oracle feasibility diagnostic meets the readiness target recorded in todo.txt.
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import contextmanager
 import json
 import random
@@ -136,6 +137,7 @@ class TrainingConfig:
     warm_start_policy_min_safe_success_rate: float = 0.10
     sac_bc_anchor_weight: float = 0.0
     sac_bc_anchor_batch_size: int = 256
+    sac_policy_anchor_weight: float = 0.0
     rl_regression_tolerance: float = 0.0
     stop_on_rl_regression: bool = False
     learning_rate: float | None = None
@@ -214,6 +216,10 @@ class TrainingConfig:
             raise ValueError("sac_bc_anchor_weight requires warm_start_transitions")
         if self.sac_bc_anchor_batch_size < 1:
             raise ValueError("sac_bc_anchor_batch_size must be positive")
+        if self.sac_policy_anchor_weight < 0.0:
+            raise ValueError("sac_policy_anchor_weight cannot be negative")
+        if self.sac_policy_anchor_weight > 0.0 and self.warm_start_transitions < 1:
+            raise ValueError("sac_policy_anchor_weight requires warm_start_transitions")
         if not 0.0 <= self.rl_regression_tolerance <= 1.0:
             raise ValueError("rl_regression_tolerance must be between 0 and 1")
         if self.learning_rate is not None and self.learning_rate <= 0.0:
@@ -964,7 +970,7 @@ def warm_start_from_safe_force_controller(model: Any, config: TrainingConfig) ->
                 loss.backward()
                 optimizer.step()
                 final_loss = float(loss.detach().cpu().item())
-    _configure_sac_bc_anchor(model, config, observations, actions)
+    _configure_sac_warm_start_anchors(model, config, observations, actions)
     return final_loss
 
 
@@ -996,25 +1002,41 @@ def _temporary_optimizer_learning_rate(optimizer: Any, learning_rate: float):
             group["lr"] = original_learning_rate
 
 
+def _configure_sac_warm_start_anchors(
+    model: Any,
+    config: TrainingConfig,
+    observations: NDArray[np.float32],
+    actions: NDArray[np.float32],
+) -> None:
+    """Attach post-BC preservation anchors for SAC actor updates."""
+
+    if config.algorithm != "sac":
+        return
+    if config.sac_bc_anchor_weight > 0.0:
+        if not hasattr(model, "set_bc_anchor"):
+            raise RuntimeError("SAC BC anchor requires the anchored SAC training class")
+        model.set_bc_anchor(
+            observations,
+            actions,
+            weight=config.sac_bc_anchor_weight,
+            batch_size=config.sac_bc_anchor_batch_size,
+            seed=config.seed + 41_000,
+        )
+    if config.sac_policy_anchor_weight > 0.0:
+        if not hasattr(model, "set_policy_anchor"):
+            raise RuntimeError("SAC policy anchor requires the anchored SAC training class")
+        model.set_policy_anchor(weight=config.sac_policy_anchor_weight)
+
+
 def _configure_sac_bc_anchor(
     model: Any,
     config: TrainingConfig,
     observations: NDArray[np.float32],
     actions: NDArray[np.float32],
 ) -> None:
-    """Attach demonstration batches for anchored SAC actor updates."""
+    """Backward-compatible wrapper for tests and older scratch tooling."""
 
-    if config.algorithm != "sac" or config.sac_bc_anchor_weight <= 0.0:
-        return
-    if not hasattr(model, "set_bc_anchor"):
-        raise RuntimeError("SAC BC anchor requires the anchored SAC training class")
-    model.set_bc_anchor(
-        observations,
-        actions,
-        weight=config.sac_bc_anchor_weight,
-        batch_size=config.sac_bc_anchor_batch_size,
-        seed=config.seed + 41_000,
-    )
+    _configure_sac_warm_start_anchors(model, config, observations, actions)
 
 
 def _collect_warm_start_demonstrations(
@@ -1174,6 +1196,8 @@ def _load_algorithms() -> dict[AlgorithmName, Any]:
             self.bc_anchor_weight = 0.0
             self.bc_anchor_batch_size = 0
             self.bc_anchor_rng = np.random.default_rng()
+            self.policy_anchor_actor = None
+            self.policy_anchor_weight = 0.0
 
         def set_bc_anchor(
             self,
@@ -1192,11 +1216,19 @@ def _load_algorithms() -> dict[AlgorithmName, Any]:
             self.bc_anchor_batch_size = int(batch_size)
             self.bc_anchor_rng = np.random.default_rng(seed)
 
+        def set_policy_anchor(self, *, weight: float) -> None:
+            self.policy_anchor_actor = copy.deepcopy(self.actor)
+            self.policy_anchor_actor.eval()
+            for parameter in self.policy_anchor_actor.parameters():
+                parameter.requires_grad_(False)
+            self.policy_anchor_weight = float(weight)
+
         def _excluded_save_params(self) -> list[str]:
             return super()._excluded_save_params() + [
                 "bc_anchor_observations",
                 "bc_anchor_actions",
                 "bc_anchor_rng",
+                "policy_anchor_actor",
             ]
 
         def train(self, gradient_steps: int, batch_size: int = 64) -> None:
@@ -1207,7 +1239,8 @@ def _load_algorithms() -> dict[AlgorithmName, Any]:
             self._update_learning_rate(optimizers)
 
             ent_coef_losses, ent_coefs = [], []
-            actor_losses, critic_losses, bc_anchor_losses = [], [], []
+            actor_losses, critic_losses = [], []
+            bc_anchor_losses, policy_anchor_losses = [], []
             for gradient_step in range(gradient_steps):
                 replay_data = self.replay_buffer.sample(
                     batch_size, env=self._vec_normalize_env
@@ -1271,6 +1304,12 @@ def _load_algorithms() -> dict[AlgorithmName, Any]:
                 if bc_anchor_loss is not None:
                     actor_loss = actor_loss + self.bc_anchor_weight * bc_anchor_loss
                     bc_anchor_losses.append(float(bc_anchor_loss.detach().cpu().item()))
+                policy_anchor_loss = self._policy_anchor_loss(replay_data.observations)
+                if policy_anchor_loss is not None:
+                    actor_loss = actor_loss + self.policy_anchor_weight * policy_anchor_loss
+                    policy_anchor_losses.append(
+                        float(policy_anchor_loss.detach().cpu().item())
+                    )
                 actor_losses.append(actor_loss.item())
 
                 self.actor.optimizer.zero_grad()
@@ -1291,6 +1330,13 @@ def _load_algorithms() -> dict[AlgorithmName, Any]:
             if bc_anchor_losses:
                 self.logger.record("train/bc_anchor_loss", np.mean(bc_anchor_losses))
                 self.logger.record("train/bc_anchor_weight", self.bc_anchor_weight)
+            if policy_anchor_losses:
+                self.logger.record(
+                    "train/policy_anchor_loss", np.mean(policy_anchor_losses)
+                )
+                self.logger.record(
+                    "train/policy_anchor_weight", self.policy_anchor_weight
+                )
 
         def _bc_anchor_loss(self) -> Any:
             if (
@@ -1305,6 +1351,14 @@ def _load_algorithms() -> dict[AlgorithmName, Any]:
             index_tensor = th.as_tensor(indices, dtype=th.long, device=self.device)
             observations = self.bc_anchor_observations[index_tensor]
             target_actions = self.bc_anchor_actions[index_tensor]
+            predicted_actions = self.actor(observations, deterministic=True)
+            return F.mse_loss(predicted_actions, target_actions)
+
+        def _policy_anchor_loss(self, observations: Any) -> Any:
+            if self.policy_anchor_weight <= 0.0 or self.policy_anchor_actor is None:
+                return None
+            with th.no_grad():
+                target_actions = self.policy_anchor_actor(observations, deterministic=True)
             predicted_actions = self.actor(observations, deterministic=True)
             return F.mse_loss(predicted_actions, target_actions)
 
@@ -1436,6 +1490,15 @@ def main() -> None:
         help="Demonstration batch size for the SAC BC-anchor regularizer.",
     )
     parser.add_argument(
+        "--sac-policy-anchor-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Opt-in SAC actor loss weight for preserving the post-BC actor on "
+            "replay observations."
+        ),
+    )
+    parser.add_argument(
         "--rl-regression-tolerance",
         type=float,
         default=0.0,
@@ -1510,6 +1573,7 @@ def main() -> None:
                 ),
                 sac_bc_anchor_weight=args.sac_bc_anchor_weight,
                 sac_bc_anchor_batch_size=args.sac_bc_anchor_batch_size,
+                sac_policy_anchor_weight=args.sac_policy_anchor_weight,
                 rl_regression_tolerance=args.rl_regression_tolerance,
                 stop_on_rl_regression=args.stop_on_rl_regression,
                 learning_rate=args.learning_rate,
