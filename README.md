@@ -23,3 +23,13 @@ Training checkpoints are evaluated on `validation_procedural` and
 `test_procedural_holdout` by default. `best.zip` is promoted by the holdout
 suite, not by household-style demo objects, so the demo path stays separated
 from the tuning path.
+
+Warm-started runs now have two guardrails before spending longer compute:
+
+- the scripted tactile teacher is validated before behavior cloning;
+- the cloned post-BC policy is evaluated before RL updates are allowed.
+
+During RL, each evaluated checkpoint is compared against the post-BC checkpoint
+in `rl_preservation.jsonl`. Use `--stop-on-rl-regression` for targeted runs
+where the goal is to preserve the tactile prior rather than let PPO/SAC erase
+it while exploring.
