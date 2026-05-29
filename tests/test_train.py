@@ -185,6 +185,14 @@ def test_sac_bc_anchor_requires_warm_start_demonstrations() -> None:
             sac_bc_anchor_weight=1.0,
             sac_bc_anchor_batch_size=0,
         )
+    with pytest.raises(ValueError, match="requires warm_start_transitions"):
+        TrainingConfig("sac", sac_policy_anchor_weight=1.0)
+    with pytest.raises(ValueError, match="cannot be negative"):
+        TrainingConfig(
+            "sac",
+            warm_start_transitions=1,
+            sac_policy_anchor_weight=-1.0,
+        )
 
 
 def test_zero_step_training_is_reserved_for_warm_start_gates() -> None:
@@ -222,6 +230,7 @@ def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
     assert TrainingConfig("ppo").warm_start_min_safe_success_rate == pytest.approx(0.10)
     assert TrainingConfig("ppo").warm_start_policy_gate_suite == "validation_procedural"
     assert TrainingConfig("ppo").warm_start_policy_min_safe_success_rate == pytest.approx(0.10)
+    assert TrainingConfig("sac").sac_policy_anchor_weight == pytest.approx(0.0)
     assert TrainingConfig("ppo").rl_regression_tolerance == pytest.approx(0.0)
     assert TrainingConfig("ppo").stop_on_rl_regression is False
     assert train_module._warm_start_curriculum_stages(TrainingConfig("ppo")) == ("upright",)
@@ -527,6 +536,29 @@ def test_sac_bc_anchor_configuration_attaches_demonstrations() -> None:
     assert call["weight"] == pytest.approx(2.5)
     assert call["batch_size"] == 64
     assert call["seed"] == 41007
+
+
+def test_sac_policy_anchor_configuration_snapshots_post_bc_actor() -> None:
+    class DummyAnchoredSac:
+        def __init__(self) -> None:
+            self.calls: list[float] = []
+
+        def set_policy_anchor(self, *, weight: float) -> None:
+            self.calls.append(weight)
+
+    model = DummyAnchoredSac()
+    observations = np.zeros((3, 360), dtype=np.float32)
+    actions = np.zeros((3, 4), dtype=np.float32)
+    config = TrainingConfig(
+        "sac",
+        warm_start_transitions=3,
+        sac_policy_anchor_weight=0.75,
+    )
+
+    train_module._configure_sac_warm_start_anchors(model, config, observations, actions)
+
+    assert len(model.calls) == 1
+    assert model.calls[0] == pytest.approx(0.75)
 
 
 def test_history_safe_force_teacher_uses_only_policy_observation_history() -> None:
