@@ -24,6 +24,7 @@ from .evaluate import (
     EvaluationSuite,
     build_locked_suite,
     run_evaluation,
+    summarize_evaluation_records,
     write_csv_report,
     write_jsonl_report,
 )
@@ -36,6 +37,9 @@ CurriculumStage = Literal[
 ]
 WarmStartTeacherName = Literal["safe_force", "composed_touch"]
 WarmStartProfileName = Literal["stage", "fragile_mix"]
+WarmStartValidationSuiteName = Literal[
+    "validation_procedural", "test_procedural_holdout", "test_pose", "test_stress"
+]
 Observation = NDArray[np.float32]
 Action = NDArray[np.float32]
 POLICY_ENV_CONFIG = EnvConfig(max_episode_steps=140)
@@ -55,10 +59,20 @@ COMPOSED_TEACHER_HIGH_FORCE = 0.42
 COMPOSED_TEACHER_LATE_CONTACT_STEP = 57
 COMPOSED_TEACHER_SPREAD_THRESHOLD = 0.34
 COMPOSED_TEACHER_MANY_CONTACTS = 3
+TOUCH_TEACHER_MODES = (
+    "round_retention",
+    "rigid_asymmetric",
+    "slippery_retention",
+    "fragile_balance",
+)
 FEASIBILITY_GATE_MESSAGE = (
     "Only the robust_upright and upright stage-1 curricula are currently certified for training. "
     "Use --allow-uncertified-environment only for deliberate pipeline dry runs "
     "on all_poses or with_chassis."
+)
+WARM_START_GATE_MESSAGE = (
+    "Warm-start teacher did not meet the procedural validation gate; lower the gate only for "
+    "deliberate debugging, or improve the teacher before behavior cloning."
 )
 
 
@@ -90,6 +104,9 @@ class TrainingConfig:
     warm_start_profile: WarmStartProfileName = "stage"
     warm_start_epochs: int = 4
     warm_start_batch_size: int = 256
+    warm_start_validation_suite: WarmStartValidationSuiteName = "validation_procedural"
+    warm_start_validation_limit: int = 24
+    warm_start_min_safe_success_rate: float = 0.10
     sac_bc_anchor_weight: float = 0.0
     sac_bc_anchor_batch_size: int = 256
 
@@ -124,6 +141,19 @@ class TrainingConfig:
             raise ValueError("warm_start_epochs must be positive")
         if self.warm_start_batch_size < 1:
             raise ValueError("warm_start_batch_size must be positive")
+        if self.warm_start_validation_suite not in {
+            "validation_procedural",
+            "test_procedural_holdout",
+            "test_pose",
+            "test_stress",
+        }:
+            raise ValueError(
+                f"Unsupported warm-start validation suite: {self.warm_start_validation_suite!r}"
+            )
+        if self.warm_start_validation_limit < 1:
+            raise ValueError("warm_start_validation_limit must be positive")
+        if not 0.0 <= self.warm_start_min_safe_success_rate <= 1.0:
+            raise ValueError("warm_start_min_safe_success_rate must be between 0 and 1")
         if self.sac_bc_anchor_weight < 0.0:
             raise ValueError("sac_bc_anchor_weight cannot be negative")
         if self.sac_bc_anchor_weight > 0.0 and self.warm_start_transitions < 1:
@@ -354,6 +384,46 @@ class _ComposedTouchTeacher:
             self.first_three_contact_step = self.step
 
 
+class WarmStartTeacherController:
+    """Evaluate warm-start teachers with the same stacked history used for BC."""
+
+    def __init__(
+        self,
+        teacher_name: WarmStartTeacherName,
+        *,
+        history_length: int = ObservationHistory.DEFAULT_HISTORY_LENGTH,
+    ) -> None:
+        if teacher_name not in {"safe_force", "composed_touch"}:
+            raise ValueError(f"Unsupported warm-start teacher: {teacher_name!r}")
+        if history_length < 1:
+            raise ValueError("history_length must be positive")
+        self.teacher_name = teacher_name
+        self.history_length = history_length
+        self._frames = np.zeros((history_length, BASE_OBSERVATION_SIZE), dtype=np.float32)
+        self._composed_teacher = _ComposedTouchTeacher()
+        self._first_action = True
+
+    def reset(self, observation: Observation, info: Mapping[str, Any]) -> None:
+        del info
+        self._frames[:] = observation
+        self._composed_teacher = _ComposedTouchTeacher()
+        self._first_action = True
+
+    def act(self, observation: Observation, info: Mapping[str, Any]) -> Action:
+        del info
+        if self._first_action:
+            self._first_action = False
+        else:
+            self._frames[:-1] = self._frames[1:].copy()
+            self._frames[-1] = observation
+        stacked_observation = self._frames.reshape(-1).copy()
+        if self.teacher_name == "safe_force":
+            return _history_safe_force_teacher_action(stacked_observation)
+        if self.teacher_name == "composed_touch":
+            return self._composed_teacher.act(stacked_observation)
+        raise AssertionError(self.teacher_name)
+
+
 def algorithm_hyperparameters(algorithm: AlgorithmName) -> dict[str, Any]:
     """Return the fixed first-pass model settings from the project roadmap."""
 
@@ -469,6 +539,35 @@ def evaluate_policy(
         write_csv_report(records, output_prefix.with_suffix(".csv"))
         write_jsonl_report(records, output_prefix.with_suffix(".jsonl"))
     return records
+
+
+def validate_warm_start_teacher(config: TrainingConfig) -> dict[str, Any]:
+    """Run the scripted teacher through a locked procedural gate before BC."""
+
+    suite = build_locked_suite(
+        config.warm_start_validation_suite,
+        limit=config.warm_start_validation_limit,
+    )
+    records = run_evaluation(
+        lambda: WarmStartTeacherController(
+            config.warm_start_teacher, history_length=config.history_length
+        ),
+        suite,
+        controller_name=f"{config.warm_start_teacher}_teacher",
+        env_config=POLICY_ENV_CONFIG,
+    )
+    summary = summarize_evaluation_records(records)
+    safe_success_rate = float(summary["safe_success_rate"])
+    if safe_success_rate < config.warm_start_min_safe_success_rate:
+        raise RuntimeError(
+            f"{WARM_START_GATE_MESSAGE} "
+            f"teacher={config.warm_start_teacher}, "
+            f"suite={config.warm_start_validation_suite}, "
+            f"safe_success_rate={safe_success_rate:.3f}, "
+            f"required={config.warm_start_min_safe_success_rate:.3f}, "
+            f"failure_modes={summary['failure_modes']}"
+        )
+    return summary
 
 
 def build_model(config: TrainingConfig, env: ObservationHistory) -> Any:
@@ -591,6 +690,7 @@ def _policy_score(records: list[dict[str, Any]]) -> tuple[float, float]:
 def warm_start_from_safe_force_controller(model: Any, config: TrainingConfig) -> float:
     """Behavior-clone a small tactile force-regulation prior into the actor."""
 
+    validate_warm_start_teacher(config)
     observations, actions = _collect_warm_start_demonstrations(config)
     try:
         import torch as th
@@ -996,6 +1096,24 @@ def main() -> None:
         help="Batch size for safe-force warm-start behavior cloning.",
     )
     parser.add_argument(
+        "--warm-start-validation-suite",
+        choices=("validation_procedural", "test_procedural_holdout", "test_pose", "test_stress"),
+        default="validation_procedural",
+        help="Locked suite used to gate the warm-start teacher before behavior cloning.",
+    )
+    parser.add_argument(
+        "--warm-start-validation-limit",
+        type=int,
+        default=24,
+        help="Number of locked cases used by the warm-start teacher gate.",
+    )
+    parser.add_argument(
+        "--warm-start-min-safe-success-rate",
+        type=float,
+        default=0.10,
+        help="Minimum safe-success rate required before cloning the warm-start teacher.",
+    )
+    parser.add_argument(
         "--sac-bc-anchor-weight",
         type=float,
         default=0.0,
@@ -1029,6 +1147,9 @@ def main() -> None:
                 warm_start_profile=args.warm_start_profile,
                 warm_start_epochs=args.warm_start_epochs,
                 warm_start_batch_size=args.warm_start_batch_size,
+                warm_start_validation_suite=args.warm_start_validation_suite,
+                warm_start_validation_limit=args.warm_start_validation_limit,
+                warm_start_min_safe_success_rate=args.warm_start_min_safe_success_rate,
                 sac_bc_anchor_weight=args.sac_bc_anchor_weight,
                 sac_bc_anchor_batch_size=args.sac_bc_anchor_batch_size,
             )
@@ -1047,8 +1168,11 @@ __all__ = [
     "FEASIBILITY_GATE_MESSAGE",
     "POLICY_ENV_CONFIG",
     "StackedPolicyController",
+    "TOUCH_TEACHER_MODES",
     "TrainingConfig",
     "TrainingResult",
+    "WARM_START_GATE_MESSAGE",
+    "WarmStartTeacherController",
     "algorithm_hyperparameters",
     "build_model",
     "curriculum_sampling_config",
@@ -1056,5 +1180,6 @@ __all__ = [
     "make_training_env",
     "require_feasibility_acknowledgement",
     "train",
+    "validate_warm_start_teacher",
     "warm_start_from_safe_force_controller",
 ]
