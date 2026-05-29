@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 
@@ -92,6 +94,26 @@ def test_curriculum_expands_poses_then_adds_compound_chassis_family() -> None:
     assert fragile_stage.training_families == ("fragile", "rounded", "container", "package")
     assert fragile_stage.allowed_poses == ("upright",)
     assert fragile_stage.safe_force_headroom_range == (2.60, 3.80)
+    assert TrainingConfig("ppo").evaluation_suites == (
+        "validation_procedural",
+        "test_procedural_holdout",
+    )
+    assert TrainingConfig("ppo").promotion_suite == "test_procedural_holdout"
+    with pytest.raises(ValueError, match="evaluation_suites"):
+        TrainingConfig("ppo", evaluation_suites=())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="duplicates"):
+        TrainingConfig(
+            "ppo",
+            evaluation_suites=("validation_procedural", "validation_procedural"),
+        )
+    with pytest.raises(ValueError, match="Unsupported evaluation"):
+        TrainingConfig("ppo", evaluation_suites=("demo",))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="promotion_suite"):
+        TrainingConfig(
+            "ppo",
+            evaluation_suites=("validation_procedural",),
+            promotion_suite="test_procedural_holdout",
+        )
 
 
 def test_stacked_policy_controller_matches_training_history_layout() -> None:
@@ -150,7 +172,7 @@ def test_zero_step_training_is_reserved_for_warm_start_gates() -> None:
 
 
 def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
-    assert TrainingConfig("ppo").warm_start_teacher == "safe_force"
+    assert TrainingConfig("ppo").warm_start_teacher == "composed_touch"
     assert train_module.TOUCH_TEACHER_MODES == (
         "round_retention",
         "rigid_asymmetric",
@@ -220,6 +242,7 @@ def test_warm_start_teacher_validation_gate_uses_procedural_summary(monkeypatch)
     monkeypatch.setattr(train_module, "run_evaluation", fake_run_evaluation)
     config = TrainingConfig(
         "ppo",
+        warm_start_teacher="safe_force",
         warm_start_validation_limit=2,
         warm_start_min_safe_success_rate=0.50,
     )
@@ -232,10 +255,71 @@ def test_warm_start_teacher_validation_gate_uses_procedural_summary(monkeypatch)
         train_module.validate_warm_start_teacher(
             TrainingConfig(
                 "ppo",
+                warm_start_teacher="safe_force",
                 warm_start_validation_limit=2,
                 warm_start_min_safe_success_rate=0.75,
             )
         )
+
+
+def test_checkpoint_evaluation_uses_all_suites_and_promotes_holdout(
+    monkeypatch, tmp_path
+) -> None:
+    calls: list[str] = []
+
+    def fake_evaluate_policy(
+        model,
+        suite,
+        *,
+        algorithm,
+        checkpoint,
+        history_length,
+        output_prefix,
+        env_config,
+    ):
+        del model, checkpoint, history_length, env_config
+        calls.append(suite.name)
+        assert algorithm == "ppo"
+        assert len(suite.cases) == 1
+        safe_success = suite.name == "test_procedural_holdout"
+        return [
+            {
+                "object_family": "rounded",
+                "outcome": "success" if safe_success else "timeout",
+                "safe_success": safe_success,
+                "peak_force": 0.25 if safe_success else 0.40,
+                "slip_events": 0,
+                "final_lift_height": 0.050 if safe_success else 0.0,
+                "max_contacts": 3 if safe_success else 0,
+            }
+        ]
+
+    monkeypatch.setattr(train_module, "evaluate_policy", fake_evaluate_policy)
+    config = TrainingConfig("ppo", evaluation_limit=1)
+
+    evaluation = train_module.evaluate_checkpoint(
+        RecordingPolicy(),
+        config,
+        checkpoint=tmp_path / "checkpoint.zip",
+        report_directory=tmp_path,
+        step_label="step_1",
+    )
+
+    assert calls == ["validation_procedural", "test_procedural_holdout"]
+    assert set(evaluation.records_by_suite) == set(config.evaluation_suites)
+    assert evaluation.report_paths["validation_procedural"] == (
+        tmp_path / "validation_procedural_step_1.csv"
+    )
+    assert evaluation.report_paths["test_procedural_holdout"] == (
+        tmp_path / "test_procedural_holdout_step_1.csv"
+    )
+    summary = json.loads(evaluation.summary_path.read_text(encoding="utf-8"))
+    assert summary["validation_procedural"]["failure_modes"] == {"timeout_no_grip": 1}
+    assert summary["test_procedural_holdout"]["safe_success_rate"] == pytest.approx(1.0)
+    assert train_module._promotion_score(evaluation.records_by_suite, config) == (
+        1.0,
+        -0.25,
+    )
 
 
 def test_sac_bc_anchor_configuration_attaches_demonstrations() -> None:
