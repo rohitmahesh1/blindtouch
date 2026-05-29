@@ -86,6 +86,10 @@ WARM_START_GATE_MESSAGE = (
     "Warm-start teacher did not meet the procedural validation gate; lower the gate only for "
     "deliberate debugging, or improve the teacher before behavior cloning."
 )
+WARM_START_POLICY_GATE_MESSAGE = (
+    "Warm-start policy did not meet the post-BC validation gate; improve behavior cloning "
+    "before spending compute on RL updates."
+)
 
 
 class PredictivePolicy(Protocol):
@@ -121,8 +125,16 @@ class TrainingConfig:
     warm_start_validation_suite: WarmStartValidationSuiteName = "validation_procedural"
     warm_start_validation_limit: int = 24
     warm_start_min_safe_success_rate: float = 0.10
+    warm_start_policy_gate_suite: EvaluationSuiteName = "validation_procedural"
+    warm_start_policy_min_safe_success_rate: float = 0.10
     sac_bc_anchor_weight: float = 0.0
     sac_bc_anchor_batch_size: int = 256
+    rl_regression_tolerance: float = 0.0
+    stop_on_rl_regression: bool = False
+    learning_rate: float | None = None
+    ppo_clip_range: float | None = None
+    ppo_target_kl: float | None = None
+    sac_learning_starts: int | None = None
 
     def __post_init__(self) -> None:
         if self.algorithm not in {"ppo", "sac"}:
@@ -176,12 +188,32 @@ class TrainingConfig:
             raise ValueError("warm_start_validation_limit must be positive")
         if not 0.0 <= self.warm_start_min_safe_success_rate <= 1.0:
             raise ValueError("warm_start_min_safe_success_rate must be between 0 and 1")
+        if self.warm_start_policy_gate_suite not in ALLOWED_EVALUATION_SUITES:
+            raise ValueError(
+                f"Unsupported warm-start policy gate suite: {self.warm_start_policy_gate_suite!r}"
+            )
+        if self.warm_start_policy_gate_suite not in self.evaluation_suites:
+            raise ValueError("warm_start_policy_gate_suite must be included in evaluation_suites")
+        if not 0.0 <= self.warm_start_policy_min_safe_success_rate <= 1.0:
+            raise ValueError(
+                "warm_start_policy_min_safe_success_rate must be between 0 and 1"
+            )
         if self.sac_bc_anchor_weight < 0.0:
             raise ValueError("sac_bc_anchor_weight cannot be negative")
         if self.sac_bc_anchor_weight > 0.0 and self.warm_start_transitions < 1:
             raise ValueError("sac_bc_anchor_weight requires warm_start_transitions")
         if self.sac_bc_anchor_batch_size < 1:
             raise ValueError("sac_bc_anchor_batch_size must be positive")
+        if not 0.0 <= self.rl_regression_tolerance <= 1.0:
+            raise ValueError("rl_regression_tolerance must be between 0 and 1")
+        if self.learning_rate is not None and self.learning_rate <= 0.0:
+            raise ValueError("learning_rate must be positive when provided")
+        if self.ppo_clip_range is not None and self.ppo_clip_range <= 0.0:
+            raise ValueError("ppo_clip_range must be positive when provided")
+        if self.ppo_target_kl is not None and self.ppo_target_kl <= 0.0:
+            raise ValueError("ppo_target_kl must be positive when provided")
+        if self.sac_learning_starts is not None and self.sac_learning_starts < 0:
+            raise ValueError("sac_learning_starts cannot be negative")
 
     @property
     def run_name(self) -> str:
@@ -208,6 +240,7 @@ class CheckpointEvaluation:
 
     records_by_suite: dict[str, list[dict[str, Any]]]
     report_paths: dict[str, Path]
+    summaries: dict[str, Any]
     summary_path: Path
 
 
@@ -457,7 +490,9 @@ class WarmStartTeacherController:
         raise AssertionError(self.teacher_name)
 
 
-def algorithm_hyperparameters(algorithm: AlgorithmName) -> dict[str, Any]:
+def algorithm_hyperparameters(
+    algorithm: AlgorithmName, config: TrainingConfig | None = None
+) -> dict[str, Any]:
     """Return the fixed first-pass model settings from the project roadmap."""
 
     common: dict[str, Any] = {
@@ -466,20 +501,32 @@ def algorithm_hyperparameters(algorithm: AlgorithmName) -> dict[str, Any]:
         "policy_kwargs": {"net_arch": [256, 256]},
     }
     if algorithm == "ppo":
-        return {
+        hyperparameters: dict[str, Any] = {
             **common,
             "learning_rate": 3e-4,
             "n_steps": 2048,
             "gae_lambda": 0.95,
         }
+        if config is not None and config.learning_rate is not None:
+            hyperparameters["learning_rate"] = config.learning_rate
+        if config is not None and config.ppo_clip_range is not None:
+            hyperparameters["clip_range"] = config.ppo_clip_range
+        if config is not None and config.ppo_target_kl is not None:
+            hyperparameters["target_kl"] = config.ppo_target_kl
+        return hyperparameters
     if algorithm == "sac":
-        return {
+        hyperparameters = {
             **common,
             "learning_rate": 1e-4,
             "buffer_size": 1_000_000,
             "learning_starts": 10_000,
             "ent_coef": "auto",
         }
+        if config is not None and config.learning_rate is not None:
+            hyperparameters["learning_rate"] = config.learning_rate
+        if config is not None and config.sac_learning_starts is not None:
+            hyperparameters["learning_starts"] = config.sac_learning_starts
+        return hyperparameters
     raise ValueError(f"Unsupported algorithm: {algorithm!r}")
 
 
@@ -603,6 +650,25 @@ def validate_warm_start_teacher(config: TrainingConfig) -> dict[str, Any]:
     return summary
 
 
+def validate_warm_start_policy(
+    summaries_by_suite: Mapping[str, Mapping[str, Any]], config: TrainingConfig
+) -> Mapping[str, Any]:
+    """Gate the cloned policy before allowing RL to update it."""
+
+    summary = summaries_by_suite[config.warm_start_policy_gate_suite]
+    safe_success_rate = float(summary["safe_success_rate"])
+    if safe_success_rate < config.warm_start_policy_min_safe_success_rate:
+        raise RuntimeError(
+            f"{WARM_START_POLICY_GATE_MESSAGE} "
+            f"algorithm={config.algorithm}, "
+            f"suite={config.warm_start_policy_gate_suite}, "
+            f"safe_success_rate={safe_success_rate:.3f}, "
+            f"required={config.warm_start_policy_min_safe_success_rate:.3f}, "
+            f"failure_modes={summary['failure_modes']}"
+        )
+    return summary
+
+
 def build_model(config: TrainingConfig, env: ObservationHistory) -> Any:
     """Instantiate an SB3 PPO or SAC model, importing training dependencies lazily."""
 
@@ -615,7 +681,7 @@ def build_model(config: TrainingConfig, env: ObservationHistory) -> Any:
         verbose=1,
         tensorboard_log=str(config.tensorboard_root),
         device=config.device,
-        **algorithm_hyperparameters(config.algorithm),
+        **algorithm_hyperparameters(config.algorithm, config),
     )
 
 
@@ -649,6 +715,8 @@ def train(config: TrainingConfig) -> TrainingResult:
     latest_report = report_directory / f"{config.promotion_suite}_step_0.csv"
     next_evaluation = min(config.evaluation_frequency, config.total_timesteps)
     final_checkpoint: Path | None = None
+    warm_start_score: tuple[float, float] | None = None
+    preservation_report = report_directory / "rl_preservation.jsonl"
     try:
         if config.warm_start_transitions > 0:
             checkpoint_base = checkpoint_directory / "step_0_warm_start"
@@ -665,6 +733,19 @@ def train(config: TrainingConfig) -> TrainingResult:
             latest_reports = evaluation.report_paths
             latest_report = latest_reports[config.promotion_suite]
             best_score = _promotion_score(evaluation.records_by_suite, config)
+            warm_start_score = best_score
+            if config.total_timesteps > 0:
+                validate_warm_start_policy(evaluation.summaries, config)
+                _append_preservation_record(
+                    preservation_report,
+                    _checkpoint_preservation_record(
+                        config,
+                        baseline_label="step_0_warm_start",
+                        baseline_score=warm_start_score,
+                        checkpoint_label="step_0_warm_start",
+                        checkpoint_score=warm_start_score,
+                    ),
+                )
             shutil.copyfile(checkpoint, best_checkpoint)
             final_checkpoint = checkpoint
         while model.num_timesteps < config.total_timesteps:
@@ -689,6 +770,18 @@ def train(config: TrainingConfig) -> TrainingResult:
             if best_score is None or score > best_score:
                 shutil.copyfile(checkpoint, best_checkpoint)
                 best_score = score
+            if warm_start_score is not None:
+                preservation = _checkpoint_preservation_record(
+                    config,
+                    baseline_label="step_0_warm_start",
+                    baseline_score=warm_start_score,
+                    checkpoint_label=f"step_{step}",
+                    checkpoint_score=score,
+                )
+                _append_preservation_record(preservation_report, preservation)
+                print(_preservation_status_message(config.algorithm, preservation))
+                if config.stop_on_rl_regression and not preservation["passed"]:
+                    break
             if model.num_timesteps >= config.total_timesteps:
                 break
             next_evaluation = min(
@@ -747,7 +840,53 @@ def evaluate_checkpoint(
         json.dumps(summaries, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    return CheckpointEvaluation(records_by_suite, report_paths, summary_path)
+    return CheckpointEvaluation(records_by_suite, report_paths, summaries, summary_path)
+
+
+def _checkpoint_preservation_record(
+    config: TrainingConfig,
+    *,
+    baseline_label: str,
+    baseline_score: tuple[float, float],
+    checkpoint_label: str,
+    checkpoint_score: tuple[float, float],
+) -> dict[str, Any]:
+    """Describe whether an RL checkpoint preserved the post-BC safe-success rate."""
+
+    baseline_safe_success_rate = baseline_score[0]
+    safe_success_rate = checkpoint_score[0]
+    baseline_mean_peak_force = -baseline_score[1]
+    mean_peak_force = -checkpoint_score[1]
+    required_safe_success_rate = max(
+        0.0, baseline_safe_success_rate - config.rl_regression_tolerance
+    )
+    return {
+        "suite": config.promotion_suite,
+        "baseline_checkpoint": baseline_label,
+        "checkpoint": checkpoint_label,
+        "baseline_safe_success_rate": baseline_safe_success_rate,
+        "safe_success_rate": safe_success_rate,
+        "safe_success_delta": safe_success_rate - baseline_safe_success_rate,
+        "required_safe_success_rate": required_safe_success_rate,
+        "passed": safe_success_rate >= required_safe_success_rate,
+        "baseline_mean_peak_force": baseline_mean_peak_force,
+        "mean_peak_force": mean_peak_force,
+        "mean_peak_force_delta": mean_peak_force - baseline_mean_peak_force,
+    }
+
+
+def _append_preservation_record(path: Path, record: Mapping[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _preservation_status_message(algorithm: AlgorithmName, record: Mapping[str, Any]) -> str:
+    status = "preserved" if record["passed"] else "regressed"
+    return (
+        f"{algorithm.upper()} preservation {record['checkpoint']}: {status}; "
+        f"{record['suite']} safe-success={record['safe_success_rate']:.3f} "
+        f"vs post-BC {record['baseline_safe_success_rate']:.3f}"
+    )
 
 
 def _promotion_score(
@@ -1205,6 +1344,18 @@ def main() -> None:
         help="Minimum safe-success rate required before cloning the warm-start teacher.",
     )
     parser.add_argument(
+        "--warm-start-policy-gate-suite",
+        choices=ALLOWED_EVALUATION_SUITES,
+        default="validation_procedural",
+        help="Evaluated suite used to gate the cloned policy before RL updates.",
+    )
+    parser.add_argument(
+        "--warm-start-policy-min-safe-success-rate",
+        type=float,
+        default=0.10,
+        help="Minimum safe-success rate required from the cloned policy before RL.",
+    )
+    parser.add_argument(
         "--sac-bc-anchor-weight",
         type=float,
         default=0.0,
@@ -1215,6 +1366,37 @@ def main() -> None:
         type=int,
         default=256,
         help="Demonstration batch size for the SAC BC-anchor regularizer.",
+    )
+    parser.add_argument(
+        "--rl-regression-tolerance",
+        type=float,
+        default=0.0,
+        help="Allowed safe-success drop from the post-BC checkpoint before flagging regression.",
+    )
+    parser.add_argument(
+        "--stop-on-rl-regression",
+        action="store_true",
+        help="Stop a run immediately after an evaluated RL checkpoint regresses from post-BC.",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        help="Override the algorithm learning rate for targeted tuning experiments.",
+    )
+    parser.add_argument(
+        "--ppo-clip-range",
+        type=float,
+        help="Override PPO clip_range to make policy updates more conservative.",
+    )
+    parser.add_argument(
+        "--ppo-target-kl",
+        type=float,
+        help="Set PPO target_kl to stop overly large update batches.",
+    )
+    parser.add_argument(
+        "--sac-learning-starts",
+        type=int,
+        help="Override SAC learning_starts for preservation experiments.",
     )
     args = parser.parse_args()
     evaluation_suites = (
@@ -1248,8 +1430,18 @@ def main() -> None:
                 warm_start_validation_suite=args.warm_start_validation_suite,
                 warm_start_validation_limit=args.warm_start_validation_limit,
                 warm_start_min_safe_success_rate=args.warm_start_min_safe_success_rate,
+                warm_start_policy_gate_suite=args.warm_start_policy_gate_suite,
+                warm_start_policy_min_safe_success_rate=(
+                    args.warm_start_policy_min_safe_success_rate
+                ),
                 sac_bc_anchor_weight=args.sac_bc_anchor_weight,
                 sac_bc_anchor_batch_size=args.sac_bc_anchor_batch_size,
+                rl_regression_tolerance=args.rl_regression_tolerance,
+                stop_on_rl_regression=args.stop_on_rl_regression,
+                learning_rate=args.learning_rate,
+                ppo_clip_range=args.ppo_clip_range,
+                ppo_target_kl=args.ppo_target_kl,
+                sac_learning_starts=args.sac_learning_starts,
             )
         )
         print(
@@ -1275,6 +1467,7 @@ __all__ = [
     "TrainingConfig",
     "TrainingResult",
     "WARM_START_GATE_MESSAGE",
+    "WARM_START_POLICY_GATE_MESSAGE",
     "WarmStartTeacherController",
     "algorithm_hyperparameters",
     "build_model",
@@ -1284,6 +1477,7 @@ __all__ = [
     "make_training_env",
     "require_feasibility_acknowledgement",
     "train",
+    "validate_warm_start_policy",
     "validate_warm_start_teacher",
     "warm_start_from_safe_force_controller",
 ]
