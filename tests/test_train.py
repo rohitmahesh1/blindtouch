@@ -250,17 +250,21 @@ def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
     assert [bucket.name for bucket in buckets] == [
         "stage_core",
         "fragile_low_margin_success",
+        "rounded_retention_success",
         "slippery_gap_success",
         "rigid_side_gap_success",
     ]
     assert buckets[0].accept_outcomes is None
+    assert buckets[0].reject_branches == ("fragile_balance",)
     assert all(bucket.accept_outcomes == ("success",) for bucket in buckets[1:])
+    assert [bucket.min_accepted_episodes for bucket in buckets[1:]] == [8, 8, 6, 6]
     assert sum(bucket.weight for bucket in buckets) == pytest.approx(1.0)
     assert train_module._transition_quotas(8624, buckets) == {
-        "stage_core": 8195,
-        "fragile_low_margin_success": 146,
-        "slippery_gap_success": 146,
-        "rigid_side_gap_success": 137,
+        "stage_core": 7247,
+        "fragile_low_margin_success": 517,
+        "rounded_retention_success": 344,
+        "slippery_gap_success": 258,
+        "rigid_side_gap_success": 258,
     }
     with pytest.raises(ValueError, match="Unsupported warm-start teacher"):
         TrainingConfig("ppo", warm_start_teacher="oracle")  # type: ignore[arg-type]
