@@ -371,6 +371,20 @@ def test_training_rng_seed_is_reproducible() -> None:
     assert float(np.random.random()) == pytest.approx(numpy_value)
 
 
+def test_torch_state_snapshot_detaches_and_clones_tensors() -> None:
+    torch = pytest.importorskip("torch")
+    layer = torch.nn.Linear(2, 1)
+
+    snapshot = train_module._snapshot_torch_state_dict(layer)
+    original_weight = snapshot["weight"].clone()
+    with torch.no_grad():
+        layer.weight.add_(1.0)
+
+    assert snapshot["weight"].requires_grad is False
+    assert snapshot["weight"] is not layer.state_dict()["weight"]
+    torch.testing.assert_close(snapshot["weight"], original_weight)
+
+
 def test_warm_start_learning_rate_context_restores_optimizer() -> None:
     class DummyOptimizer:
         def __init__(self) -> None:
