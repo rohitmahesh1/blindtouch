@@ -9,7 +9,6 @@ oracle feasibility diagnostic meets the readiness target recorded in todo.txt.
 from __future__ import annotations
 
 import argparse
-import copy
 from contextlib import contextmanager
 import json
 import random
@@ -842,6 +841,15 @@ def _seed_training_rngs(seed: int) -> None:
         th.cuda.manual_seed_all(seed)
 
 
+def _snapshot_torch_state_dict(module: Any) -> dict[str, Any]:
+    """Clone a torch module state dict without copying autograd history."""
+
+    return {
+        name: tensor.detach().clone()
+        for name, tensor in module.state_dict().items()
+    }
+
+
 def evaluate_checkpoint(
     model: PredictivePolicy,
     config: TrainingConfig,
@@ -1185,6 +1193,10 @@ def _load_algorithms() -> dict[AlgorithmName, Any]:
             "Training dependencies are missing. Install stable-baselines3 and tensorboard "
             "in .venv before running blindtouch.train."
         ) from error
+    try:
+        from torch.func import functional_call
+    except ImportError:
+        from torch.nn.utils.stateless import functional_call  # type: ignore[no-redef]
 
     class AnchoredSAC(SAC):
         """SAC with an optional behavior-cloning anchor for warm-start demos."""
@@ -1196,7 +1208,7 @@ def _load_algorithms() -> dict[AlgorithmName, Any]:
             self.bc_anchor_weight = 0.0
             self.bc_anchor_batch_size = 0
             self.bc_anchor_rng = np.random.default_rng()
-            self.policy_anchor_actor = None
+            self.policy_anchor_state_dict = None
             self.policy_anchor_weight = 0.0
 
         def set_bc_anchor(
@@ -1217,10 +1229,7 @@ def _load_algorithms() -> dict[AlgorithmName, Any]:
             self.bc_anchor_rng = np.random.default_rng(seed)
 
         def set_policy_anchor(self, *, weight: float) -> None:
-            self.policy_anchor_actor = copy.deepcopy(self.actor)
-            self.policy_anchor_actor.eval()
-            for parameter in self.policy_anchor_actor.parameters():
-                parameter.requires_grad_(False)
+            self.policy_anchor_state_dict = _snapshot_torch_state_dict(self.actor)
             self.policy_anchor_weight = float(weight)
 
         def _excluded_save_params(self) -> list[str]:
@@ -1228,7 +1237,7 @@ def _load_algorithms() -> dict[AlgorithmName, Any]:
                 "bc_anchor_observations",
                 "bc_anchor_actions",
                 "bc_anchor_rng",
-                "policy_anchor_actor",
+                "policy_anchor_state_dict",
             ]
 
         def train(self, gradient_steps: int, batch_size: int = 64) -> None:
@@ -1355,10 +1364,15 @@ def _load_algorithms() -> dict[AlgorithmName, Any]:
             return F.mse_loss(predicted_actions, target_actions)
 
         def _policy_anchor_loss(self, observations: Any) -> Any:
-            if self.policy_anchor_weight <= 0.0 or self.policy_anchor_actor is None:
+            if self.policy_anchor_weight <= 0.0 or self.policy_anchor_state_dict is None:
                 return None
             with th.no_grad():
-                target_actions = self.policy_anchor_actor(observations, deterministic=True)
+                target_actions = functional_call(
+                    self.actor,
+                    self.policy_anchor_state_dict,
+                    (observations,),
+                    {"deterministic": True},
+                )
             predicted_actions = self.actor(observations, deterministic=True)
             return F.mse_loss(predicted_actions, target_actions)
 
