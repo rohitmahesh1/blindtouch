@@ -30,7 +30,7 @@ from .evaluate import (
     write_csv_report,
     write_jsonl_report,
 )
-from .objects import SamplingConfig
+from .objects import EpisodeObject, SamplingConfig
 
 
 AlgorithmName = Literal["ppo", "sac"]
@@ -43,6 +43,7 @@ EvaluationSuiteName = Literal[
 WarmStartTeacherName = Literal["safe_force", "composed_touch"]
 WarmStartProfileName = Literal["stage", "fragile_mix", "stratified_quality"]
 WarmStartValidationSuiteName = EvaluationSuiteName
+DemoTeacherName = Literal["composed_touch", "privileged_fragile"]
 Observation = NDArray[np.float32]
 Action = NDArray[np.float32]
 POLICY_ENV_CONFIG = EnvConfig(max_episode_steps=140)
@@ -272,6 +273,7 @@ class _WarmStartDemoBucket:
     accept_branches: tuple[str, ...] | None = None
     reject_branches: tuple[str, ...] = ()
     min_accepted_episodes: int = 0
+    teacher: DemoTeacherName = "composed_touch"
     seed_offset: int = 17_000
 
 
@@ -451,6 +453,64 @@ class _FragileBalancedContinuation(_ForceBandContinuation):
             stable_steps_required=6,
             max_acquire_steps=34,
             min_contacts=2,
+        )
+
+
+class _PrivilegedFragilePadTeacher:
+    """Offline-only simulation expert for fragile demonstration collection.
+
+    This teacher intentionally reads hidden object limits and diagnostic pad
+    forces. It must not be used as an evaluation controller or deployed policy;
+    its job is to produce clean fragile trajectories for BC, after which the
+    learned policy still receives only proprioception and tactile taxels.
+    """
+
+    branch_name = "privileged_fragile"
+
+    def __init__(self, episode_object: EpisodeObject) -> None:
+        required_pad_force = episode_object.mass * 9.81 / (
+            3.0 * episode_object.friction
+        )
+        target_pad_force = min(
+            episode_object.safe_force * 0.62,
+            max(required_pad_force * 1.45, episode_object.safe_force * 0.34),
+        )
+        self.low_force = max(0.020, target_pad_force * 0.78)
+        self.high_force = min(episode_object.safe_force * 0.78, target_pad_force * 1.18)
+        self.approach_rate = 0.20
+        self.close_rate = 0.070
+        self.trim_close_rate = 0.030
+        self.release_rate = 0.120
+        self.lift_rate = 0.36
+        self.fallback_step = 72
+        self.fallback_contacts = 2
+        self.step = 0
+        self.stable_steps = 0
+        self.lifting = False
+
+    def act(self, info: Mapping[str, Any]) -> Action:
+        pad_forces = np.asarray(info["pad_forces"], dtype=np.float32)
+        contact_count = int(np.count_nonzero(pad_forces >= 0.015))
+        ready_count = int(np.count_nonzero(pad_forces >= self.low_force))
+        balanced = bool(ready_count >= 3 and float(np.max(pad_forces)) <= self.high_force)
+        self.stable_steps = self.stable_steps + 1 if balanced else 0
+        self.lifting = self.lifting or self.stable_steps >= 4
+        if self.step >= self.fallback_step and ready_count >= self.fallback_contacts:
+            self.lifting = True
+
+        if contact_count == 0:
+            finger_actions = np.full(3, self.approach_rate, dtype=np.float32)
+        else:
+            close_rate = self.trim_close_rate if self.lifting else self.close_rate
+            finger_actions = np.where(
+                pad_forces < self.low_force,
+                close_rate,
+                np.where(pad_forces > self.high_force, -self.release_rate, 0.0),
+            ).astype(np.float32)
+
+        self.step += 1
+        return np.r_[self.lift_rate if self.lifting else 0.0, finger_actions].astype(
+            np.float32
         )
 
 
@@ -1260,6 +1320,7 @@ def _collect_demo_bucket(
                 "attempts": 0,
                 "accepted_episodes": 0,
                 "min_accepted_episodes": bucket.min_accepted_episodes,
+                "teacher": bucket.teacher,
                 "accept_outcomes": (
                     list(bucket.accept_outcomes) if bucket.accept_outcomes else "all"
                 ),
@@ -1299,12 +1360,21 @@ def _collect_demo_bucket(
             (collected_transitions < target_transitions)
             or (accepted < bucket.min_accepted_episodes)
         ) and attempts < max_attempts:
-            stacked_observation, _ = env.reset(seed=seed + attempts)
-            teacher = _ComposedTouchTeacher()
+            stacked_observation, info = env.reset(seed=seed + attempts)
+            if bucket.teacher == "privileged_fragile":
+                episode_object = env.unwrapped.object_params
+                if episode_object is None:
+                    raise RuntimeError("Expected object parameters for privileged teacher")
+                teacher: Any = _PrivilegedFragilePadTeacher(episode_object)
+            else:
+                teacher = _ComposedTouchTeacher()
             episode_observations: list[Observation] = []
             episode_actions: list[Action] = []
             while True:
-                action = teacher.act(stacked_observation)
+                if bucket.teacher == "privileged_fragile":
+                    action = teacher.act(info)
+                else:
+                    action = teacher.act(stacked_observation)
                 episode_observations.append(stacked_observation.copy())
                 episode_actions.append(action.copy())
                 stacked_observation, _, terminated, truncated, info = env.step(action)
@@ -1313,7 +1383,10 @@ def _collect_demo_bucket(
 
             attempts += 1
             outcome = str(info["outcome"])
-            branch = teacher.selected_branch or "probe_only"
+            if bucket.teacher == "privileged_fragile":
+                branch = teacher.branch_name
+            else:
+                branch = teacher.selected_branch or "probe_only"
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
             branches[branch] = branches.get(branch, 0) + 1
             if bucket.accept_branches is not None and branch not in bucket.accept_branches:
@@ -1370,6 +1443,7 @@ def _collect_demo_bucket(
         "attempts": attempts,
         "accepted_episodes": accepted,
         "min_accepted_episodes": bucket.min_accepted_episodes,
+        "teacher": bucket.teacher,
         "accept_outcomes": list(bucket.accept_outcomes) if bucket.accept_outcomes else "all",
         "accept_branches": list(bucket.accept_branches) if bucket.accept_branches else "all",
         "reject_branches": list(bucket.reject_branches),
@@ -1468,6 +1542,7 @@ def _stratified_quality_demo_buckets(
             ),
             accept_outcomes=success,
             min_accepted_episodes=8,
+            teacher="privileged_fragile",
             seed_offset=43_000,
         ),
         _WarmStartDemoBucket(
