@@ -14,11 +14,13 @@ from blindtouch.evaluate import (
     SUITE_SIZES,
     add_overlay,
     build_locked_suite,
+    classify_failure_mode,
     group_feasibility_failures,
     public_controller_info,
     run_feasibility_diagnostic,
     run_evaluation,
     search_feasible_trajectories,
+    summarize_evaluation_records,
     write_csv_report,
     write_feasibility_report,
     write_jsonl_report,
@@ -136,6 +138,58 @@ def test_scripted_evaluation_reports_are_repeatable_and_complete(tmp_path) -> No
         json.loads(line) for line in first_jsonl.read_text(encoding="utf-8").splitlines()
     ]
     assert json_rows == first
+
+
+def test_evaluation_summary_groups_object_agnostic_failure_modes() -> None:
+    records = [
+        {
+            "object_family": "rounded",
+            "outcome": "success",
+            "safe_success": True,
+            "peak_force": 0.40,
+            "slip_events": 0,
+            "final_lift_height": 0.050,
+            "max_contacts": 3,
+        },
+        {
+            "object_family": "rounded",
+            "outcome": "timeout",
+            "safe_success": False,
+            "peak_force": 0.10,
+            "slip_events": 0,
+            "final_lift_height": 0.0,
+            "max_contacts": 0,
+        },
+        {
+            "object_family": "slippery",
+            "outcome": "timeout",
+            "safe_success": False,
+            "peak_force": 0.25,
+            "slip_events": 2,
+            "final_lift_height": 0.010,
+            "max_contacts": 2,
+        },
+        {
+            "object_family": "fragile",
+            "outcome": "damage",
+            "safe_success": False,
+            "peak_force": 1.20,
+            "slip_events": 0,
+            "final_lift_height": 0.020,
+            "max_contacts": 3,
+        },
+    ]
+
+    summary = summarize_evaluation_records(records)
+
+    assert classify_failure_mode(records[0]) == "success"
+    assert classify_failure_mode(records[1]) == "timeout_no_grip"
+    assert classify_failure_mode(records[2]) == "slip"
+    assert summary["safe_success_rate"] == pytest.approx(0.25)
+    assert summary["failure_modes"] == {"damage": 1, "slip": 1, "timeout_no_grip": 1}
+    assert summary["by_family"]["rounded"]["safe_success_rate"] == pytest.approx(0.5)
+    assert set(summary["by_family"]) == {"fragile", "rounded", "slippery"}
+    assert "object_name" not in summary
 
 
 class PublicOnlyController:
