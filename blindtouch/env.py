@@ -111,6 +111,22 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         "previous_action": slice(39, 43),
         "phase": slice(43, 45),
     }
+    REWARD_COMPONENT_NAMES = (
+        "time_cost",
+        "action_cost",
+        "force_cost",
+        "over_force_cost",
+        "probe_shaping",
+        "contact_shaping",
+        "contact_balance_shaping",
+        "safe_force_shaping",
+        "lift_progress",
+        "lift_readiness",
+        "stall_cost",
+        "slip_cost",
+        "terminal",
+        "timeout",
+    )
 
     def __init__(
         self,
@@ -224,6 +240,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._reset_valid = True
         self._rejected_reset_samples = 0
         self._lift_attempt_steps = 0
+        self._last_reward_components = self._empty_reward_components()
 
     def reset(
         self,
@@ -282,6 +299,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._initial_palm_height = float(self.data.qpos[self._palm_qpos_adr])
         self._outcome = None
         self._lift_attempt_steps = 0
+        self._last_reward_components = self._empty_reward_components()
 
         observation = self._observation()
         info = self._info()
@@ -399,7 +417,9 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         truncated = bool(not terminated and self._step_count >= self.config.max_episode_steps)
         if truncated:
             self._outcome = "timeout"
-            reward -= self._timeout_penalty()
+            timeout_penalty = self._timeout_penalty()
+            self._last_reward_components["timeout"] = -timeout_penalty
+            reward -= timeout_penalty
 
         self._previous_lift_height = lift_height
         self._previous_object_xy = object_xy
@@ -651,50 +671,67 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         contact_count = int(grip_metrics["contact_count"])
         grip_score = float(grip_metrics["grip_score"])
         balance_score = float(grip_metrics["balance_score"])
-        reward = -0.004
-        reward -= 0.001 * float(np.mean(np.square(action)))
-        reward -= 0.003 * force_fraction**2
+        components = self._empty_reward_components()
+        components["time_cost"] = -0.004
+        components["action_cost"] = -0.001 * float(np.mean(np.square(action)))
+        components["force_cost"] = -0.003 * force_fraction**2
         if force_fraction > 0.70:
-            reward -= 0.080 * (force_fraction - 0.70) ** 2
+            components["over_force_cost"] -= 0.080 * (force_fraction - 0.70) ** 2
 
         finger_closing = np.clip(action[1:], 0.0, 1.0)
         mean_finger_close = float(np.mean(finger_closing))
         close_symmetry = 1.0 - float(np.std(finger_closing))
         if not lift_allowed and contact_count < 2:
-            reward += (
+            components["probe_shaping"] += (
                 self.config.coordinated_probe_reward_scale
                 * mean_finger_close
                 * np.clip(close_symmetry, 0.0, 1.0)
             )
-        reward += self.config.contact_reward_scale * grip_score
+        components["contact_shaping"] += self.config.contact_reward_scale * grip_score
         if contact_count >= 2:
-            reward += self.config.contact_balance_reward_scale * balance_score
+            components["contact_balance_shaping"] += (
+                self.config.contact_balance_reward_scale * balance_score
+            )
             safe_margin_score = float(np.clip((0.62 - force_fraction) / 0.62, 0.0, 1.0))
-            reward += self.config.safe_force_band_reward_scale * grip_score * safe_margin_score
+            components["safe_force_shaping"] += (
+                self.config.safe_force_band_reward_scale * grip_score * safe_margin_score
+            )
         elif contact_count == 1:
             strongest_contact = float(np.max(pad_forces) / grip_metrics["target_pad_force"])
-            reward -= self.config.single_contact_penalty * min(strongest_contact, 2.0)
+            components["contact_shaping"] -= (
+                self.config.single_contact_penalty * min(strongest_contact, 2.0)
+            )
         elif self._step_count > 8:
-            reward -= self.config.no_contact_penalty * (1.0 - grip_score)
+            components["contact_shaping"] -= (
+                self.config.no_contact_penalty * (1.0 - grip_score)
+            )
         if force_fraction > 0.55:
-            reward -= self.config.over_force_penalty_scale * (force_fraction - 0.55) ** 2
+            components["over_force_cost"] -= (
+                self.config.over_force_penalty_scale * (force_fraction - 0.55) ** 2
+            )
 
         if lift_allowed:
-            reward += (
+            components["lift_progress"] += (
                 self.config.lift_progress_reward_scale
                 * (lift_height - self._previous_lift_height)
                 / self.config.lift_target_height
             )
             lift_request = max(float(action[0]), 0.0)
             if lift_request > 0.0 and grip_score < 0.45:
-                reward -= self.config.premature_lift_penalty * lift_request * (1.0 - grip_score)
+                components["lift_readiness"] -= (
+                    self.config.premature_lift_penalty * lift_request * (1.0 - grip_score)
+                )
             elif lift_request > 0.0 and contact_count >= 2:
-                reward += self.config.ready_lift_bonus * lift_request * grip_score
+                components["lift_readiness"] += (
+                    self.config.ready_lift_bonus * lift_request * grip_score
+                )
             lift_fraction = float(
                 np.clip(lift_height / self.config.lift_target_height, 0.0, 1.0)
             )
             if contact_count >= 2 and lift_height > 0.0:
-                reward += self.config.lifted_grip_reward_scale * grip_score * lift_fraction
+                components["lift_progress"] += (
+                    self.config.lifted_grip_reward_scale * grip_score * lift_fraction
+                )
             if (
                 self._step_count > self.config.exploration_steps + 12
                 and contact_count >= 2
@@ -705,20 +742,26 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
                 stalled_fraction = 1.0 - float(
                     np.clip(lift_height / self.config.attempted_lift_height, 0.0, 1.0)
                 )
-                reward -= self.config.grip_stall_penalty * grip_score * stalled_fraction
+                components["stall_cost"] -= (
+                    self.config.grip_stall_penalty * grip_score * stalled_fraction
+                )
             if self._step_count > self.config.exploration_steps + 12 and contact_count == 0:
-                reward -= self.config.no_contact_penalty
+                components["contact_shaping"] -= self.config.no_contact_penalty
         if slipped:
-            reward -= 0.25
+            components["slip_cost"] -= 0.25
         if damaged:
-            reward -= self.config.damage_penalty
+            components["terminal"] -= self.config.damage_penalty
         elif unstable:
-            reward -= self.config.unstable_penalty
+            components["terminal"] -= self.config.unstable_penalty
         elif dropped:
-            reward -= self.config.drop_penalty
+            components["terminal"] -= self.config.drop_penalty
         elif succeeded:
-            reward += self.config.success_reward
-        return reward
+            components["terminal"] += self.config.success_reward
+        self._last_reward_components = components
+        return float(sum(components.values()))
+
+    def _empty_reward_components(self) -> dict[str, float]:
+        return {name: 0.0 for name in self.REWARD_COMPONENT_NAMES}
 
     def _timeout_penalty(self) -> float:
         penalty = self.config.timeout_penalty
@@ -824,6 +867,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             "slip_events": self._slip_events,
             "cumulative_slip_distance": self._cumulative_slip_distance,
             "lift_attempt_steps": self._lift_attempt_steps,
+            "reward_components": dict(self._last_reward_components),
             "initial_palm_height": self._initial_palm_height,
             "initial_penetration": self._initial_penetration,
             "settle_xy_displacement": self._settle_xy_displacement,
