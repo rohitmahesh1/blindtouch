@@ -142,6 +142,7 @@ class TrainingConfig:
     ppo_clip_range: float | None = None
     ppo_target_kl: float | None = None
     sac_learning_starts: int | None = None
+    sac_ent_coef: float | None = None
 
     def __post_init__(self) -> None:
         if self.algorithm not in {"ppo", "sac"}:
@@ -223,6 +224,8 @@ class TrainingConfig:
             raise ValueError("ppo_target_kl must be positive when provided")
         if self.sac_learning_starts is not None and self.sac_learning_starts < 0:
             raise ValueError("sac_learning_starts cannot be negative")
+        if self.sac_ent_coef is not None and self.sac_ent_coef <= 0.0:
+            raise ValueError("sac_ent_coef must be positive when provided")
 
     @property
     def run_name(self) -> str:
@@ -535,6 +538,8 @@ def algorithm_hyperparameters(
             hyperparameters["learning_rate"] = config.learning_rate
         if config is not None and config.sac_learning_starts is not None:
             hyperparameters["learning_starts"] = config.sac_learning_starts
+        if config is not None and config.sac_ent_coef is not None:
+            hyperparameters["ent_coef"] = config.sac_ent_coef
         return hyperparameters
     raise ValueError(f"Unsupported algorithm: {algorithm!r}")
 
@@ -1461,6 +1466,11 @@ def main() -> None:
         type=int,
         help="Override SAC learning_starts for preservation experiments.",
     )
+    parser.add_argument(
+        "--sac-ent-coef",
+        type=float,
+        help="Use a fixed SAC entropy coefficient instead of the default auto tuner.",
+    )
     args = parser.parse_args()
     evaluation_suites = (
         tuple(args.evaluation_suites)
@@ -1506,6 +1516,7 @@ def main() -> None:
                 ppo_clip_range=args.ppo_clip_range,
                 ppo_target_kl=args.ppo_target_kl,
                 sac_learning_starts=args.sac_learning_starts,
+                sac_ent_coef=args.sac_ent_coef,
             )
         )
         print(
