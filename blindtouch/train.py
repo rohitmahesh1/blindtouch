@@ -9,6 +9,7 @@ oracle feasibility diagnostic meets the readiness target recorded in todo.txt.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import random
 import shutil
@@ -57,6 +58,10 @@ DEFAULT_EVALUATION_SUITES: tuple[EvaluationSuiteName, ...] = (
     "test_procedural_holdout",
 )
 DEFAULT_PROMOTION_SUITE: EvaluationSuiteName = "test_procedural_holdout"
+DEFAULT_WARM_START_LEARNING_RATES: dict[AlgorithmName, float] = {
+    "ppo": 3e-4,
+    "sac": 1e-4,
+}
 WARM_START_TARGET_FORCE = 0.34
 WARM_START_FORCE_BAND = 0.10
 WARM_START_CONTACT_THRESHOLD = 0.035
@@ -123,6 +128,7 @@ class TrainingConfig:
     warm_start_profile: WarmStartProfileName = "stage"
     warm_start_epochs: int = 4
     warm_start_batch_size: int = 256
+    warm_start_learning_rate: float | None = None
     warm_start_validation_suite: WarmStartValidationSuiteName = "validation_procedural"
     warm_start_validation_limit: int = 24
     warm_start_min_safe_success_rate: float = 0.10
@@ -181,6 +187,8 @@ class TrainingConfig:
             raise ValueError("warm_start_epochs must be positive")
         if self.warm_start_batch_size < 1:
             raise ValueError("warm_start_batch_size must be positive")
+        if self.warm_start_learning_rate is not None and self.warm_start_learning_rate <= 0.0:
+            raise ValueError("warm_start_learning_rate must be positive when provided")
         if self.warm_start_validation_suite not in ALLOWED_EVALUATION_SUITES:
             raise ValueError(
                 f"Unsupported warm-start validation suite: {self.warm_start_validation_suite!r}"
@@ -930,27 +938,57 @@ def warm_start_from_safe_force_controller(model: Any, config: TrainingConfig) ->
 
     obs_tensor = th.as_tensor(observations, dtype=th.float32, device=model.device)
     action_tensor = th.as_tensor(actions, dtype=th.float32, device=model.device)
+    optimizer = _warm_start_optimizer(model, config.algorithm)
     rng = np.random.default_rng(config.seed + 29_000)
     final_loss = 0.0
-    for _ in range(config.warm_start_epochs):
-        for indices in _batch_indices(
-            rng, len(observations), config.warm_start_batch_size
-        ):
-            batch_obs = obs_tensor[indices]
-            batch_actions = action_tensor[indices]
-            if config.algorithm == "ppo":
-                optimizer = model.policy.optimizer
-                predicted_actions = model.policy.get_distribution(batch_obs).mode()
-            else:
-                optimizer = model.actor.optimizer
-                predicted_actions = model.actor(batch_obs, deterministic=True)
-            loss = (predicted_actions - batch_actions).pow(2).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            final_loss = float(loss.detach().cpu().item())
+    with _temporary_optimizer_learning_rate(
+        optimizer, _warm_start_learning_rate(config)
+    ):
+        for _ in range(config.warm_start_epochs):
+            for indices in _batch_indices(
+                rng, len(observations), config.warm_start_batch_size
+            ):
+                batch_obs = obs_tensor[indices]
+                batch_actions = action_tensor[indices]
+                if config.algorithm == "ppo":
+                    predicted_actions = model.policy.get_distribution(batch_obs).mode()
+                else:
+                    predicted_actions = model.actor(batch_obs, deterministic=True)
+                loss = (predicted_actions - batch_actions).pow(2).mean()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                final_loss = float(loss.detach().cpu().item())
     _configure_sac_bc_anchor(model, config, observations, actions)
     return final_loss
+
+
+def _warm_start_optimizer(model: Any, algorithm: AlgorithmName) -> Any:
+    if algorithm == "ppo":
+        return model.policy.optimizer
+    return model.actor.optimizer
+
+
+def _warm_start_learning_rate(config: TrainingConfig) -> float:
+    return (
+        config.warm_start_learning_rate
+        if config.warm_start_learning_rate is not None
+        else DEFAULT_WARM_START_LEARNING_RATES[config.algorithm]
+    )
+
+
+@contextmanager
+def _temporary_optimizer_learning_rate(optimizer: Any, learning_rate: float):
+    original_learning_rates = [group["lr"] for group in optimizer.param_groups]
+    for group in optimizer.param_groups:
+        group["lr"] = learning_rate
+    try:
+        yield
+    finally:
+        for group, original_learning_rate in zip(
+            optimizer.param_groups, original_learning_rates, strict=True
+        ):
+            group["lr"] = original_learning_rate
 
 
 def _configure_sac_bc_anchor(
@@ -1343,6 +1381,14 @@ def main() -> None:
         help="Batch size for safe-force warm-start behavior cloning.",
     )
     parser.add_argument(
+        "--warm-start-learning-rate",
+        type=float,
+        help=(
+            "Override the behavior-cloning learning rate. Defaults to the "
+            "algorithm's first-pass rate even when --learning-rate lowers RL updates."
+        ),
+    )
+    parser.add_argument(
         "--warm-start-validation-suite",
         choices=("validation_procedural", "test_procedural_holdout", "test_pose", "test_stress"),
         default="validation_procedural",
@@ -1444,6 +1490,7 @@ def main() -> None:
                 warm_start_profile=args.warm_start_profile,
                 warm_start_epochs=args.warm_start_epochs,
                 warm_start_batch_size=args.warm_start_batch_size,
+                warm_start_learning_rate=args.warm_start_learning_rate,
                 warm_start_validation_suite=args.warm_start_validation_suite,
                 warm_start_validation_limit=args.warm_start_validation_limit,
                 warm_start_min_safe_success_rate=args.warm_start_min_safe_success_rate,
@@ -1475,6 +1522,7 @@ __all__ = [
     "ALLOWED_EVALUATION_SUITES",
     "DEFAULT_EVALUATION_SUITES",
     "DEFAULT_PROMOTION_SUITE",
+    "DEFAULT_WARM_START_LEARNING_RATES",
     "CheckpointEvaluation",
     "EvaluationSuiteName",
     "FEASIBILITY_GATE_MESSAGE",
