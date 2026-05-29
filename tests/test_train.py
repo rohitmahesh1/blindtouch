@@ -151,9 +151,18 @@ def test_zero_step_training_is_reserved_for_warm_start_gates() -> None:
 
 def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
     assert TrainingConfig("ppo").warm_start_teacher == "safe_force"
+    assert train_module.TOUCH_TEACHER_MODES == (
+        "round_retention",
+        "rigid_asymmetric",
+        "slippery_retention",
+        "fragile_balance",
+    )
     assert TrainingConfig("ppo", warm_start_teacher="composed_touch").warm_start_teacher == (
         "composed_touch"
     )
+    assert TrainingConfig("ppo").warm_start_validation_suite == "validation_procedural"
+    assert TrainingConfig("ppo").warm_start_validation_limit == 24
+    assert TrainingConfig("ppo").warm_start_min_safe_success_rate == pytest.approx(0.10)
     assert train_module._warm_start_curriculum_stages(TrainingConfig("ppo")) == ("upright",)
     assert train_module._warm_start_curriculum_stages(
         TrainingConfig("ppo", warm_start_profile="fragile_mix")
@@ -169,6 +178,64 @@ def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
         TrainingConfig("ppo", warm_start_teacher="oracle")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="Unsupported warm-start profile"):
         TrainingConfig("ppo", warm_start_profile="oracle")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="validation suite"):
+        TrainingConfig("ppo", warm_start_validation_suite="demo")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="validation_limit"):
+        TrainingConfig("ppo", warm_start_validation_limit=0)
+    with pytest.raises(ValueError, match="safe_success_rate"):
+        TrainingConfig("ppo", warm_start_min_safe_success_rate=1.1)
+
+
+def test_warm_start_teacher_validation_gate_uses_procedural_summary(monkeypatch) -> None:
+    def fake_run_evaluation(controller_factory, suite, **kwargs):
+        assert suite.name == "validation_procedural"
+        assert len(suite.cases) == 2
+        assert kwargs["controller_name"] == "safe_force_teacher"
+        controller = controller_factory()
+        observation = np.zeros(45, dtype=np.float32)
+        controller.reset(observation, {"phase": "explore", "step": 0, "outcome": None})
+        action = controller.act(observation, {"phase": "explore", "step": 0, "outcome": None})
+        assert action.shape == (4,)
+        return [
+            {
+                "object_family": "rounded",
+                "outcome": "success",
+                "safe_success": True,
+                "peak_force": 0.30,
+                "slip_events": 0,
+                "final_lift_height": 0.050,
+                "max_contacts": 3,
+            },
+            {
+                "object_family": "fragile",
+                "outcome": "damage",
+                "safe_success": False,
+                "peak_force": 0.90,
+                "slip_events": 0,
+                "final_lift_height": 0.020,
+                "max_contacts": 3,
+            },
+        ]
+
+    monkeypatch.setattr(train_module, "run_evaluation", fake_run_evaluation)
+    config = TrainingConfig(
+        "ppo",
+        warm_start_validation_limit=2,
+        warm_start_min_safe_success_rate=0.50,
+    )
+
+    summary = train_module.validate_warm_start_teacher(config)
+
+    assert summary["safe_success_rate"] == pytest.approx(0.50)
+    assert summary["failure_modes"] == {"damage": 1}
+    with pytest.raises(RuntimeError, match="procedural validation gate"):
+        train_module.validate_warm_start_teacher(
+            TrainingConfig(
+                "ppo",
+                warm_start_validation_limit=2,
+                warm_start_min_safe_success_rate=0.75,
+            )
+        )
 
 
 def test_sac_bc_anchor_configuration_attaches_demonstrations() -> None:
