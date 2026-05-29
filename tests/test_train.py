@@ -192,6 +192,16 @@ def test_zero_step_training_is_reserved_for_warm_start_gates() -> None:
 
 def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
     assert TrainingConfig("ppo").warm_start_teacher == "composed_touch"
+    assert TrainingConfig("ppo").warm_start_learning_rate is None
+    assert train_module._warm_start_learning_rate(
+        TrainingConfig("ppo", learning_rate=2e-5)
+    ) == pytest.approx(3e-4)
+    assert train_module._warm_start_learning_rate(
+        TrainingConfig("sac", learning_rate=5e-5)
+    ) == pytest.approx(1e-4)
+    assert train_module._warm_start_learning_rate(
+        TrainingConfig("sac", warm_start_learning_rate=7e-5)
+    ) == pytest.approx(7e-5)
     assert train_module.TOUCH_TEACHER_MODES == (
         "round_retention",
         "rigid_asymmetric",
@@ -229,6 +239,8 @@ def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
         TrainingConfig("ppo", warm_start_validation_limit=0)
     with pytest.raises(ValueError, match="safe_success_rate"):
         TrainingConfig("ppo", warm_start_min_safe_success_rate=1.1)
+    with pytest.raises(ValueError, match="warm_start_learning_rate"):
+        TrainingConfig("ppo", warm_start_learning_rate=0.0)
     with pytest.raises(ValueError, match="policy gate suite"):
         TrainingConfig("ppo", warm_start_policy_gate_suite="demo")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="included in evaluation_suites"):
@@ -340,6 +352,18 @@ def test_training_rng_seed_is_reproducible() -> None:
 
     assert random.random() == pytest.approx(python_value)
     assert float(np.random.random()) == pytest.approx(numpy_value)
+
+
+def test_warm_start_learning_rate_context_restores_optimizer() -> None:
+    class DummyOptimizer:
+        def __init__(self) -> None:
+            self.param_groups = [{"lr": 1e-5}, {"lr": 2e-5}]
+
+    optimizer = DummyOptimizer()
+    with train_module._temporary_optimizer_learning_rate(optimizer, 3e-4):
+        assert [group["lr"] for group in optimizer.param_groups] == [3e-4, 3e-4]
+
+    assert [group["lr"] for group in optimizer.param_groups] == [1e-5, 2e-5]
 
 
 def test_warm_start_policy_gate_uses_post_bc_checkpoint_summary() -> None:
