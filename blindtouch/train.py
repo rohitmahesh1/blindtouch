@@ -35,15 +35,27 @@ AlgorithmName = Literal["ppo", "sac"]
 CurriculumStage = Literal[
     "robust_upright", "upright", "fragile_upright", "all_poses", "with_chassis"
 ]
-WarmStartTeacherName = Literal["safe_force", "composed_touch"]
-WarmStartProfileName = Literal["stage", "fragile_mix"]
-WarmStartValidationSuiteName = Literal[
+EvaluationSuiteName = Literal[
     "validation_procedural", "test_procedural_holdout", "test_pose", "test_stress"
 ]
+WarmStartTeacherName = Literal["safe_force", "composed_touch"]
+WarmStartProfileName = Literal["stage", "fragile_mix"]
+WarmStartValidationSuiteName = EvaluationSuiteName
 Observation = NDArray[np.float32]
 Action = NDArray[np.float32]
 POLICY_ENV_CONFIG = EnvConfig(max_episode_steps=140)
 BASE_OBSERVATION_SIZE = 45
+ALLOWED_EVALUATION_SUITES: tuple[EvaluationSuiteName, ...] = (
+    "validation_procedural",
+    "test_procedural_holdout",
+    "test_pose",
+    "test_stress",
+)
+DEFAULT_EVALUATION_SUITES: tuple[EvaluationSuiteName, ...] = (
+    "validation_procedural",
+    "test_procedural_holdout",
+)
+DEFAULT_PROMOTION_SUITE: EvaluationSuiteName = "test_procedural_holdout"
 WARM_START_TARGET_FORCE = 0.34
 WARM_START_FORCE_BAND = 0.10
 WARM_START_CONTACT_THRESHOLD = 0.035
@@ -94,13 +106,15 @@ class TrainingConfig:
     curriculum_stage: CurriculumStage = "upright"
     evaluation_frequency: int = 50_000
     evaluation_limit: int | None = None
+    evaluation_suites: tuple[EvaluationSuiteName, ...] = DEFAULT_EVALUATION_SUITES
+    promotion_suite: EvaluationSuiteName = DEFAULT_PROMOTION_SUITE
     output_root: Path = Path("runs")
     checkpoint_root: Path = Path("checkpoints")
     tensorboard_root: Path = Path("runs/tensorboard")
     device: str = "auto"
     allow_uncertified_environment: bool = False
     warm_start_transitions: int = 0
-    warm_start_teacher: WarmStartTeacherName = "safe_force"
+    warm_start_teacher: WarmStartTeacherName = "composed_touch"
     warm_start_profile: WarmStartProfileName = "stage"
     warm_start_epochs: int = 4
     warm_start_batch_size: int = 256
@@ -129,6 +143,19 @@ class TrainingConfig:
             raise ValueError("evaluation_frequency must be positive")
         if self.evaluation_limit is not None and self.evaluation_limit < 1:
             raise ValueError("evaluation_limit must be positive when provided")
+        if not self.evaluation_suites:
+            raise ValueError("evaluation_suites must contain at least one suite")
+        if len(set(self.evaluation_suites)) != len(self.evaluation_suites):
+            raise ValueError("evaluation_suites cannot contain duplicates")
+        unsupported_suites = [
+            suite for suite in self.evaluation_suites if suite not in ALLOWED_EVALUATION_SUITES
+        ]
+        if unsupported_suites:
+            raise ValueError(f"Unsupported evaluation suites: {unsupported_suites!r}")
+        if self.promotion_suite not in ALLOWED_EVALUATION_SUITES:
+            raise ValueError(f"Unsupported promotion suite: {self.promotion_suite!r}")
+        if self.promotion_suite not in self.evaluation_suites:
+            raise ValueError("promotion_suite must be included in evaluation_suites")
         if self.warm_start_transitions < 0:
             raise ValueError("warm_start_transitions cannot be negative")
         if self.total_timesteps == 0 and self.warm_start_transitions == 0:
@@ -141,12 +168,7 @@ class TrainingConfig:
             raise ValueError("warm_start_epochs must be positive")
         if self.warm_start_batch_size < 1:
             raise ValueError("warm_start_batch_size must be positive")
-        if self.warm_start_validation_suite not in {
-            "validation_procedural",
-            "test_procedural_holdout",
-            "test_pose",
-            "test_stress",
-        }:
+        if self.warm_start_validation_suite not in ALLOWED_EVALUATION_SUITES:
             raise ValueError(
                 f"Unsupported warm-start validation suite: {self.warm_start_validation_suite!r}"
             )
@@ -175,7 +197,18 @@ class TrainingResult:
     final_checkpoint: Path
     best_checkpoint: Path
     latest_report: Path
+    latest_reports: dict[str, Path]
+    promotion_suite: str
     best_safe_success_rate: float
+
+
+@dataclass(frozen=True)
+class CheckpointEvaluation:
+    """Evaluation reports and summaries for one saved checkpoint."""
+
+    records_by_suite: dict[str, list[dict[str, Any]]]
+    report_paths: dict[str, Path]
+    summary_path: Path
 
 
 class StackedPolicyController:
@@ -612,7 +645,8 @@ def train(config: TrainingConfig) -> TrainingResult:
         )
     best_score: tuple[float, float] | None = None
     best_checkpoint = checkpoint_directory / "best.zip"
-    latest_report = report_directory / "validation_procedural_step_0.csv"
+    latest_reports: dict[str, Path] = {}
+    latest_report = report_directory / f"{config.promotion_suite}_step_0.csv"
     next_evaluation = min(config.evaluation_frequency, config.total_timesteps)
     final_checkpoint: Path | None = None
     try:
@@ -621,18 +655,16 @@ def train(config: TrainingConfig) -> TrainingResult:
             model.save(str(checkpoint_base))
             checkpoint = checkpoint_base.with_suffix(".zip")
             loaded_model = model_class.load(str(checkpoint), device=config.device)
-            suite = build_locked_suite("validation_procedural", limit=config.evaluation_limit)
-            prefix = report_directory / "validation_procedural_step_0_warm_start"
-            records = evaluate_policy(
+            evaluation = evaluate_checkpoint(
                 loaded_model,
-                suite,
-                algorithm=config.algorithm,
-                checkpoint=str(checkpoint),
-                history_length=config.history_length,
-                output_prefix=prefix,
+                config,
+                checkpoint=checkpoint,
+                report_directory=report_directory,
+                step_label="step_0_warm_start",
             )
-            latest_report = prefix.with_suffix(".csv")
-            best_score = _policy_score(records)
+            latest_reports = evaluation.report_paths
+            latest_report = latest_reports[config.promotion_suite]
+            best_score = _promotion_score(evaluation.records_by_suite, config)
             shutil.copyfile(checkpoint, best_checkpoint)
             final_checkpoint = checkpoint
         while model.num_timesteps < config.total_timesteps:
@@ -644,18 +676,16 @@ def train(config: TrainingConfig) -> TrainingResult:
             checkpoint = checkpoint_base.with_suffix(".zip")
             final_checkpoint = checkpoint
             loaded_model = model_class.load(str(checkpoint), device=config.device)
-            suite = build_locked_suite("validation_procedural", limit=config.evaluation_limit)
-            prefix = report_directory / f"validation_procedural_step_{step}"
-            records = evaluate_policy(
+            evaluation = evaluate_checkpoint(
                 loaded_model,
-                suite,
-                algorithm=config.algorithm,
-                checkpoint=str(checkpoint),
-                history_length=config.history_length,
-                output_prefix=prefix,
+                config,
+                checkpoint=checkpoint,
+                report_directory=report_directory,
+                step_label=f"step_{step}",
             )
-            latest_report = prefix.with_suffix(".csv")
-            score = _policy_score(records)
+            latest_reports = evaluation.report_paths
+            latest_report = latest_reports[config.promotion_suite]
+            score = _promotion_score(evaluation.records_by_suite, config)
             if best_score is None or score > best_score:
                 shutil.copyfile(checkpoint, best_checkpoint)
                 best_score = score
@@ -677,8 +707,53 @@ def train(config: TrainingConfig) -> TrainingResult:
         final_checkpoint=final_checkpoint,
         best_checkpoint=best_checkpoint,
         latest_report=latest_report,
+        latest_reports=latest_reports,
+        promotion_suite=config.promotion_suite,
         best_safe_success_rate=best_score[0],
     )
+
+
+def evaluate_checkpoint(
+    model: PredictivePolicy,
+    config: TrainingConfig,
+    *,
+    checkpoint: Path,
+    report_directory: Path,
+    step_label: str,
+) -> CheckpointEvaluation:
+    """Evaluate one checkpoint on every configured suite and write summaries."""
+
+    records_by_suite: dict[str, list[dict[str, Any]]] = {}
+    report_paths: dict[str, Path] = {}
+    summaries: dict[str, Any] = {}
+    for suite_name in config.evaluation_suites:
+        suite = build_locked_suite(suite_name, limit=config.evaluation_limit)
+        prefix = report_directory / f"{suite_name}_{step_label}"
+        records = evaluate_policy(
+            model,
+            suite,
+            algorithm=config.algorithm,
+            checkpoint=str(checkpoint),
+            history_length=config.history_length,
+            output_prefix=prefix,
+            env_config=POLICY_ENV_CONFIG,
+        )
+        records_by_suite[suite_name] = records
+        report_paths[suite_name] = prefix.with_suffix(".csv")
+        summaries[suite_name] = summarize_evaluation_records(records)
+
+    summary_path = report_directory / f"summary_{step_label}.json"
+    summary_path.write_text(
+        json.dumps(summaries, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return CheckpointEvaluation(records_by_suite, report_paths, summary_path)
+
+
+def _promotion_score(
+    records_by_suite: Mapping[str, list[dict[str, Any]]], config: TrainingConfig
+) -> tuple[float, float]:
+    return _policy_score(records_by_suite[config.promotion_suite])
 
 
 def _policy_score(records: list[dict[str, Any]]) -> tuple[float, float]:
@@ -1056,6 +1131,22 @@ def main() -> None:
     )
     parser.add_argument("--eval-every", type=int, default=50_000)
     parser.add_argument("--eval-limit", type=int)
+    parser.add_argument(
+        "--eval-suite",
+        action="append",
+        choices=ALLOWED_EVALUATION_SUITES,
+        dest="evaluation_suites",
+        help=(
+            "Suite to evaluate at every checkpoint. May be passed multiple times; "
+            "defaults to validation_procedural and test_procedural_holdout."
+        ),
+    )
+    parser.add_argument(
+        "--promotion-suite",
+        choices=ALLOWED_EVALUATION_SUITES,
+        default=DEFAULT_PROMOTION_SUITE,
+        help="Configured evaluation suite used to choose best.zip.",
+    )
     parser.add_argument("--output-root", type=Path, default=Path("runs"))
     parser.add_argument("--checkpoint-root", type=Path, default=Path("checkpoints"))
     parser.add_argument("--tensorboard-root", type=Path, default=Path("runs/tensorboard"))
@@ -1074,7 +1165,7 @@ def main() -> None:
     parser.add_argument(
         "--warm-start-teacher",
         choices=("safe_force", "composed_touch"),
-        default="safe_force",
+        default="composed_touch",
         help="Scripted touch-only teacher used for behavior-cloning warm starts.",
     )
     parser.add_argument(
@@ -1126,6 +1217,11 @@ def main() -> None:
         help="Demonstration batch size for the SAC BC-anchor regularizer.",
     )
     args = parser.parse_args()
+    evaluation_suites = (
+        tuple(args.evaluation_suites)
+        if args.evaluation_suites is not None
+        else DEFAULT_EVALUATION_SUITES
+    )
 
     selected = ("ppo", "sac") if args.algorithm == "both" else (args.algorithm,)
     for algorithm in selected:
@@ -1137,6 +1233,8 @@ def main() -> None:
                 curriculum_stage=args.stage,
                 evaluation_frequency=args.eval_every,
                 evaluation_limit=args.eval_limit,
+                evaluation_suites=evaluation_suites,
+                promotion_suite=args.promotion_suite,
                 output_root=args.output_root,
                 checkpoint_root=args.checkpoint_root,
                 tensorboard_root=args.tensorboard_root,
@@ -1156,7 +1254,7 @@ def main() -> None:
         )
         print(
             f"{result.algorithm.upper()} trained {result.trained_timesteps} steps; "
-            f"best validation safe-success={result.best_safe_success_rate:.3f}; "
+            f"best {result.promotion_suite} safe-success={result.best_safe_success_rate:.3f}; "
             f"checkpoint={result.best_checkpoint}"
         )
 
@@ -1165,6 +1263,11 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "ALLOWED_EVALUATION_SUITES",
+    "DEFAULT_EVALUATION_SUITES",
+    "DEFAULT_PROMOTION_SUITE",
+    "CheckpointEvaluation",
+    "EvaluationSuiteName",
     "FEASIBILITY_GATE_MESSAGE",
     "POLICY_ENV_CONFIG",
     "StackedPolicyController",
@@ -1176,6 +1279,7 @@ __all__ = [
     "algorithm_hyperparameters",
     "build_model",
     "curriculum_sampling_config",
+    "evaluate_checkpoint",
     "evaluate_policy",
     "make_training_env",
     "require_feasibility_acknowledgement",
