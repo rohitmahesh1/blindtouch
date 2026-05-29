@@ -256,6 +256,8 @@ def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
     ]
     assert buckets[0].accept_outcomes is None
     assert buckets[0].reject_branches == ("fragile_balance",)
+    assert buckets[0].teacher == "composed_touch"
+    assert buckets[1].teacher == "privileged_fragile"
     assert all(bucket.accept_outcomes == ("success",) for bucket in buckets[1:])
     assert [bucket.min_accepted_episodes for bucket in buckets[1:]] == [8, 8, 6, 6]
     assert sum(bucket.weight for bucket in buckets) == pytest.approx(1.0)
