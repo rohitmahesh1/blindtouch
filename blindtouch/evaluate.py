@@ -31,21 +31,29 @@ from .env import BlindTouchEnv, EnvConfig
 from .objects import (
     EpisodeObject,
     SamplingConfig,
+    TRAINING_FAMILIES,
     episode_object_from_mapping,
     sample_training_object,
 )
 
 
 SUITE_SIZES = {
-    "validation_interp": 300,
+    "validation_procedural": 300,
+    "test_procedural_holdout": 300,
     "test_pose": 200,
     "test_stress": 100,
 }
 SUITE_SEED_OFFSETS = {
-    "validation_interp": 10_000,
+    "validation_procedural": 10_000,
+    "test_procedural_holdout": 50_000,
     "test_pose": 20_000,
     "test_stress": 40_000,
 }
+RETIRED_SUITE_ALIASES = {
+    "test_household": "dev_household_seen",
+    "validation_interp": "validation_procedural",
+}
+PROCEDURAL_SUITE_FAMILIES = tuple(TRAINING_FAMILIES)
 BASELINE_ENV_CONFIG = EnvConfig(exploration_steps=0, max_episode_steps=120)
 REPORT_FIELDS = (
     "controller",
@@ -181,12 +189,19 @@ def build_locked_suite(name: str, *, limit: int | None = None) -> EvaluationSuit
     """Build one evaluation suite from fixed seeds and auditable constructors."""
 
     if name not in SUITE_SIZES:
+        if name in RETIRED_SUITE_ALIASES:
+            replacement = RETIRED_SUITE_ALIASES[name]
+            raise ValueError(
+                f"Suite {name!r} is retired on main; use {replacement!r} for historical "
+                "discussion or a current procedural suite for new experiments."
+            )
         raise ValueError(f"Unknown evaluation suite: {name!r}")
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive when provided")
     count = SUITE_SIZES[name] if limit is None else min(limit, SUITE_SIZES[name])
     builder = {
-        "validation_interp": _validation_case,
+        "validation_procedural": _validation_case,
+        "test_procedural_holdout": _holdout_case,
         "test_pose": _pose_case,
         "test_stress": _stress_case,
     }[name]
@@ -896,9 +911,25 @@ def write_jsonl_report(records: Iterable[dict[str, Any]], path: str | Path) -> P
 
 
 def _validation_case(index: int) -> EvaluationCase:
-    seed = SUITE_SEED_OFFSETS["validation_interp"] + index
-    episode_object = sample_training_object(np.random.default_rng(seed))
-    return EvaluationCase("validation_interp", seed, episode_object)
+    return _procedural_case("validation_procedural", index)
+
+
+def _holdout_case(index: int) -> EvaluationCase:
+    return _procedural_case("test_procedural_holdout", index)
+
+
+def _procedural_case(suite_name: str, index: int) -> EvaluationCase:
+    seed = SUITE_SEED_OFFSETS[suite_name] + index
+    family = PROCEDURAL_SUITE_FAMILIES[index % len(PROCEDURAL_SUITE_FAMILIES)]
+    episode_object = sample_training_object(
+        np.random.default_rng(seed),
+        SamplingConfig(training_families=(family,)),
+    )
+    episode_object = replace(
+        episode_object,
+        evaluation_tags=episode_object.evaluation_tags + (suite_name,),
+    )
+    return EvaluationCase(suite_name, seed, episode_object)
 
 
 def _pose_case(index: int) -> EvaluationCase:
@@ -953,29 +984,9 @@ def _replace_pose(episode_object: EpisodeObject, pose: str) -> EpisodeObject:
     )
 
 
-def _apply_yaw(
-    base: tuple[float, float, float, float], yaw: float
-) -> tuple[float, float, float, float]:
-    yaw_quaternion = np.array(
-        [np.cos(yaw / 2.0), 0.0, 0.0, np.sin(yaw / 2.0)], dtype=np.float64
-    )
-    w1, x1, y1, z1 = yaw_quaternion
-    w2, x2, y2, z2 = base
-    quaternion = np.array(
-        [
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        ]
-    )
-    quaternion /= np.linalg.norm(quaternion)
-    return tuple(float(value) for value in quaternion)  # type: ignore[return-value]
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run deterministic BlindTouch evaluation.")
-    parser.add_argument("--suite", choices=tuple(SUITE_SIZES), default="validation_interp")
+    parser.add_argument("--suite", choices=tuple(SUITE_SIZES), default="validation_procedural")
     parser.add_argument(
         "--feasibility",
         action="store_true",
@@ -1047,6 +1058,7 @@ __all__ = [
     "FEASIBILITY_TRAJECTORY_PLANS",
     "REPORT_FIELDS",
     "ReplayResult",
+    "RETIRED_SUITE_ALIASES",
     "SUITE_SIZES",
     "add_overlay",
     "build_locked_suite",

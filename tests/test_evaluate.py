@@ -3,12 +3,14 @@ import json
 from typing import Any, Mapping
 
 import numpy as np
+import pytest
 
 from blindtouch.controllers import FixedGripController
 from blindtouch.env import BlindTouchEnv, EnvConfig, ObservationHistory
 from blindtouch.evaluate import (
     FEASIBILITY_REPORT_FIELDS,
     REPORT_FIELDS,
+    RETIRED_SUITE_ALIASES,
     SUITE_SIZES,
     add_overlay,
     build_locked_suite,
@@ -77,6 +79,25 @@ def test_locked_suites_have_fixed_sizes_and_reproducible_metadata() -> None:
         assert len(first.cases) == count
         assert first == second
 
+    validation_cases = build_locked_suite("validation_procedural").cases
+    holdout_cases = build_locked_suite("test_procedural_holdout").cases
+    assert {case.object.family for case in validation_cases} == {
+        "rounded",
+        "container",
+        "package",
+        "slippery",
+        "fragile",
+        "chassis",
+    }
+    assert {case.object.family for case in holdout_cases} == {
+        "rounded",
+        "container",
+        "package",
+        "slippery",
+        "fragile",
+        "chassis",
+    }
+    assert validation_cases[0].seed != holdout_cases[0].seed
     pose_cases = build_locked_suite("test_pose").cases
     assert all(
         case.object.pose in {"side_x", "side_y"} and case.object.family in {"container", "package"}
@@ -86,6 +107,9 @@ def test_locked_suites_have_fixed_sizes_and_reproducible_metadata() -> None:
         "stress" in case.object.evaluation_tags
         for case in build_locked_suite("test_stress").cases
     )
+    assert RETIRED_SUITE_ALIASES["test_household"] == "dev_household_seen"
+    with pytest.raises(ValueError, match="retired"):
+        build_locked_suite("test_household")
 
 
 def test_scripted_evaluation_reports_are_repeatable_and_complete(tmp_path) -> None:
@@ -133,7 +157,7 @@ def test_evaluator_does_not_supply_hidden_object_or_render_state_to_controller()
 
     records = run_evaluation(
         PublicOnlyController,
-        build_locked_suite("validation_interp", limit=1),
+        build_locked_suite("validation_procedural", limit=1),
         controller_name="public_only",
         env_config=EnvConfig(exploration_steps=0, max_episode_steps=2),
     )

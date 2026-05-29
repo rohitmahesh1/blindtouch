@@ -73,6 +73,13 @@ def test_curriculum_expands_poses_then_adds_compound_chassis_family() -> None:
     assert any(metadata["family"] == "chassis" for metadata in family_metadata)
     with_chassis.close()
     stage_one = curriculum_sampling_config("upright")
+    assert stage_one.training_families == (
+        "rounded",
+        "container",
+        "package",
+        "slippery",
+        "fragile",
+    )
     assert stage_one.allowed_poses == ("upright",)
     assert stage_one.offset_range == (-0.002, 0.002)
     assert stage_one.safe_force_margin == pytest.approx(3.0)
@@ -82,7 +89,7 @@ def test_curriculum_expands_poses_then_adds_compound_chassis_family() -> None:
     assert robust_stage.mass_range == (0.030, 0.110)
     assert robust_stage.safe_force_margin == pytest.approx(4.0)
     fragile_stage = curriculum_sampling_config("fragile_upright")
-    assert fragile_stage.training_families == ("rounded", "container", "package")
+    assert fragile_stage.training_families == ("fragile", "rounded", "container", "package")
     assert fragile_stage.allowed_poses == ("upright",)
     assert fragile_stage.safe_force_headroom_range == (2.60, 3.80)
 

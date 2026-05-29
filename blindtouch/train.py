@@ -412,14 +412,14 @@ def curriculum_sampling_config(stage: CurriculumStage) -> SamplingConfig:
         )
     if stage == "upright":
         return SamplingConfig(
-            training_families=("rounded", "container", "package"),
+            training_families=("rounded", "container", "package", "slippery", "fragile"),
             allowed_poses=("upright",),
             offset_range=(-0.002, 0.002),
             safe_force_margin=3.0,
         )
     if stage == "fragile_upright":
         return SamplingConfig(
-            training_families=("rounded", "container", "package"),
+            training_families=("fragile", "rounded", "container", "package"),
             allowed_poses=("upright",),
             offset_range=(-0.002, 0.002),
             friction_range=(0.45, 1.10),
@@ -429,7 +429,9 @@ def curriculum_sampling_config(stage: CurriculumStage) -> SamplingConfig:
             holding_force_margin=0.75,
         )
     if stage == "all_poses":
-        return SamplingConfig(training_families=("rounded", "container", "package"))
+        return SamplingConfig(
+            training_families=("rounded", "container", "package", "slippery", "fragile")
+        )
     if stage == "with_chassis":
         return SamplingConfig()
     raise ValueError(f"Unsupported curriculum stage: {stage!r}")
@@ -511,7 +513,7 @@ def train(config: TrainingConfig) -> TrainingResult:
         )
     best_score: tuple[float, float] | None = None
     best_checkpoint = checkpoint_directory / "best.zip"
-    latest_report = report_directory / "validation_interp_step_0.csv"
+    latest_report = report_directory / "validation_procedural_step_0.csv"
     next_evaluation = min(config.evaluation_frequency, config.total_timesteps)
     final_checkpoint: Path | None = None
     try:
@@ -520,8 +522,8 @@ def train(config: TrainingConfig) -> TrainingResult:
             model.save(str(checkpoint_base))
             checkpoint = checkpoint_base.with_suffix(".zip")
             loaded_model = model_class.load(str(checkpoint), device=config.device)
-            suite = build_locked_suite("validation_interp", limit=config.evaluation_limit)
-            prefix = report_directory / "validation_interp_step_0_warm_start"
+            suite = build_locked_suite("validation_procedural", limit=config.evaluation_limit)
+            prefix = report_directory / "validation_procedural_step_0_warm_start"
             records = evaluate_policy(
                 loaded_model,
                 suite,
@@ -543,8 +545,8 @@ def train(config: TrainingConfig) -> TrainingResult:
             checkpoint = checkpoint_base.with_suffix(".zip")
             final_checkpoint = checkpoint
             loaded_model = model_class.load(str(checkpoint), device=config.device)
-            suite = build_locked_suite("validation_interp", limit=config.evaluation_limit)
-            prefix = report_directory / f"validation_interp_step_{step}"
+            suite = build_locked_suite("validation_procedural", limit=config.evaluation_limit)
+            prefix = report_directory / f"validation_procedural_step_{step}"
             records = evaluate_policy(
                 loaded_model,
                 suite,

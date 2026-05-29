@@ -15,6 +15,12 @@ import numpy as np
 Quaternion = tuple[float, float, float, float]
 FloatRange = tuple[float, float]
 SUPPORTED_GEOMS = ("cylinder", "box", "capsule", "ellipsoid", "chassis")
+TOUCH_SKILL_MODES = (
+    "round_retention",
+    "rigid_asymmetric",
+    "slippery_retention",
+    "fragile_balance",
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,7 @@ class ObjectFamily:
     safe_force_range: FloatRange
     visual_style: str
     stable_poses: tuple[StablePose, ...]
+    skill_modes: tuple[str, ...]
     evaluation_tags: tuple[str, ...] = ()
 
 
@@ -79,7 +86,14 @@ class EpisodeObject:
 class SamplingConfig:
     """Training distribution controls shared by training and evaluation code."""
 
-    training_families: tuple[str, ...] = ("rounded", "container", "package", "chassis")
+    training_families: tuple[str, ...] = (
+        "rounded",
+        "container",
+        "package",
+        "slippery",
+        "fragile",
+        "chassis",
+    )
     allowed_poses: tuple[str, ...] | None = None
     offset_range: FloatRange = (-0.006, 0.006)
     friction_range: FloatRange | None = None
@@ -116,7 +130,8 @@ TRAINING_FAMILIES: dict[str, ObjectFamily] = {
         safe_force_range=(0.40, 2.80),
         visual_style="abstract_rounded",
         stable_poses=(UPRIGHT,),
-        evaluation_tags=("training", "rounded"),
+        skill_modes=("round_retention",),
+        evaluation_tags=("training", "rounded", "round_retention"),
     ),
     "container": ObjectFamily(
         identifier="container",
@@ -129,7 +144,8 @@ TRAINING_FAMILIES: dict[str, ObjectFamily] = {
         safe_force_range=(0.40, 2.80),
         visual_style="abstract_container",
         stable_poses=(UPRIGHT, SIDE_X),
-        evaluation_tags=("training", "container"),
+        skill_modes=("round_retention", "slippery_retention"),
+        evaluation_tags=("training", "container", "round_retention"),
     ),
     "package": ObjectFamily(
         identifier="package",
@@ -142,7 +158,36 @@ TRAINING_FAMILIES: dict[str, ObjectFamily] = {
         safe_force_range=(0.40, 2.80),
         visual_style="abstract_package",
         stable_poses=(UPRIGHT, SIDE_X, SIDE_Y),
-        evaluation_tags=("training", "package"),
+        skill_modes=("rigid_asymmetric",),
+        evaluation_tags=("training", "package", "rigid_asymmetric"),
+    ),
+    "slippery": ObjectFamily(
+        identifier="slippery",
+        collision_kinds=("box", "cylinder", "capsule", "ellipsoid"),
+        half_size_x_range=(0.021, 0.035),
+        half_size_y_range=(0.020, 0.034),
+        half_size_z_range=(0.014, 0.042),
+        mass_range=(0.030, 0.150),
+        friction_range=(0.16, 0.36),
+        safe_force_range=(0.70, 3.00),
+        visual_style="abstract_slippery",
+        stable_poses=(UPRIGHT, SIDE_X, SIDE_Y),
+        skill_modes=("slippery_retention",),
+        evaluation_tags=("training", "slippery", "slippery_retention"),
+    ),
+    "fragile": ObjectFamily(
+        identifier="fragile",
+        collision_kinds=("ellipsoid", "box", "cylinder"),
+        half_size_x_range=(0.022, 0.033),
+        half_size_y_range=(0.021, 0.033),
+        half_size_z_range=(0.018, 0.038),
+        mass_range=(0.025, 0.090),
+        friction_range=(0.65, 1.20),
+        safe_force_range=(0.28, 0.90),
+        visual_style="abstract_fragile",
+        stable_poses=(UPRIGHT, SIDE_X, SIDE_Y),
+        skill_modes=("fragile_balance",),
+        evaluation_tags=("training", "fragile", "fragile_balance"),
     ),
     "chassis": ObjectFamily(
         identifier="chassis",
@@ -155,7 +200,8 @@ TRAINING_FAMILIES: dict[str, ObjectFamily] = {
         safe_force_range=(0.70, 2.80),
         visual_style="abstract_chassis",
         stable_poses=(WHEELS_DOWN,),
-        evaluation_tags=("training", "compound"),
+        skill_modes=("rigid_asymmetric",),
+        evaluation_tags=("training", "compound", "rigid_asymmetric"),
     )
 }
 
@@ -170,6 +216,9 @@ def sample_training_object(
     if family_name not in TRAINING_FAMILIES:
         raise ValueError(f"Unsupported active training family: {family_name!r}")
     family = TRAINING_FAMILIES[family_name]
+    for mode in family.skill_modes:
+        if mode not in TOUCH_SKILL_MODES:
+            raise ValueError(f"Family {family.identifier!r} declares unknown skill mode {mode!r}")
     shape = str(rng.choice(family.collision_kinds))
     stable_poses = (
         family.stable_poses
@@ -343,6 +392,7 @@ __all__ = [
     "ObjectFamily",
     "SamplingConfig",
     "StablePose",
+    "TOUCH_SKILL_MODES",
     "TRAINING_FAMILIES",
     "episode_object_from_mapping",
     "sample_training_object",
