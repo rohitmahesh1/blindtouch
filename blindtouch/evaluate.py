@@ -430,6 +430,67 @@ def group_feasibility_failures(records: Iterable[dict[str, Any]]) -> list[dict[s
     ]
 
 
+def classify_failure_mode(record: Mapping[str, Any]) -> str:
+    """Map one evaluation row to an object-agnostic failure bucket."""
+
+    if bool(record.get("safe_success")):
+        return "success"
+    outcome = str(record.get("outcome") or "unknown")
+    if outcome in {"damage", "drop", "unstable"}:
+        return outcome
+    if int(record.get("slip_events", 0) or 0) > 0:
+        return "slip"
+    if outcome == "timeout":
+        max_contacts = int(record.get("max_contacts", 0) or 0)
+        final_lift_height = float(record.get("final_lift_height", 0.0) or 0.0)
+        if max_contacts < 2:
+            return "timeout_no_grip"
+        if final_lift_height < BASELINE_ENV_CONFIG.attempted_lift_height * 0.50:
+            return "timeout_no_lift"
+        if final_lift_height < BASELINE_ENV_CONFIG.lift_target_height:
+            return "timeout_weak_lift"
+        return "timeout_hold"
+    return outcome
+
+
+def summarize_evaluation_records(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize procedural evaluation trends without object-name tuning hooks."""
+
+    rows = list(records)
+    summary = _evaluation_subset_summary(rows)
+    summary["by_family"] = {
+        family: _evaluation_subset_summary(
+            [record for record in rows if str(record["object_family"]) == family]
+        )
+        for family in sorted({str(record["object_family"]) for record in rows})
+    }
+    return summary
+
+
+def _evaluation_subset_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    success_count = sum(bool(record["safe_success"]) for record in rows)
+    outcome_counts = Counter(str(record["outcome"]) for record in rows)
+    failure_counts = Counter(
+        classify_failure_mode(record) for record in rows if not bool(record["safe_success"])
+    )
+    return {
+        "episodes": len(rows),
+        "safe_successes": success_count,
+        "safe_success_rate": success_count / len(rows) if rows else 0.0,
+        "outcomes": dict(sorted(outcome_counts.items())),
+        "failure_modes": dict(sorted(failure_counts.items())),
+        "mean_peak_force": _mean_record_value(rows, "peak_force"),
+        "mean_slip_events": _mean_record_value(rows, "slip_events"),
+        "mean_final_lift_height": _mean_record_value(rows, "final_lift_height"),
+    }
+
+
+def _mean_record_value(rows: list[dict[str, Any]], field: str) -> float:
+    if not rows:
+        return 0.0
+    return float(np.mean([float(record[field]) for record in rows]))
+
+
 def write_feasibility_report(
     records: Iterable[dict[str, Any]], output_prefix: str | Path
 ) -> tuple[Path, Path, Path]:
@@ -1062,6 +1123,7 @@ __all__ = [
     "SUITE_SIZES",
     "add_overlay",
     "build_locked_suite",
+    "classify_failure_mode",
     "encode_frame_sequence",
     "group_feasibility_failures",
     "public_controller_info",
@@ -1069,6 +1131,7 @@ __all__ = [
     "run_evaluation",
     "run_feasibility_diagnostic",
     "search_feasible_trajectories",
+    "summarize_evaluation_records",
     "write_csv_report",
     "write_feasibility_report",
     "write_jsonl_report",
