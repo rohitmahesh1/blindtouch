@@ -34,6 +34,8 @@ def test_environment_satisfies_gymnasium_contract() -> None:
     assert "pose" in info["object_params"]
     assert info["reset_valid"]
     assert len(env.TAXEL_NAMES) == 27
+    assert set(info["reward_components"]) == set(env.REWARD_COMPONENT_NAMES)
+    assert sum(info["reward_components"].values()) == pytest.approx(0.0)
     env.close()
 
 
@@ -237,6 +239,22 @@ def test_reward_shaping_prefers_balanced_touch_to_inaction() -> None:
     assert touch_metrics["contact_count"] == 3
     assert touch_metrics["grip_score"] > 0.0
     assert touch_reward > no_touch_reward
+    env.close()
+
+
+def test_reward_components_sum_to_episode_reward() -> None:
+    env = BlindTouchEnv(config=EnvConfig(exploration_steps=0, max_episode_steps=1))
+    env.reset(options={"object_params": FIXED_OBJECT})
+
+    _, reward, terminated, truncated, info = env.step(np.zeros(4, dtype=np.float32))
+
+    assert not terminated
+    assert truncated
+    assert info["outcome"] == "timeout"
+    components = info["reward_components"]
+    assert set(components) == set(env.REWARD_COMPONENT_NAMES)
+    assert components["timeout"] < 0.0
+    assert sum(components.values()) == pytest.approx(reward)
     env.close()
 
 
