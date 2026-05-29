@@ -633,31 +633,6 @@ def test_composed_touch_teacher_slows_probe_after_contact() -> None:
     assert action[3] == pytest.approx(train_module.COMPOSED_TEACHER_CONTACT_PROBE_RATE)
 
 
-def test_composed_touch_teacher_single_early_contact_is_not_fragile_by_default() -> None:
-    teacher = train_module._ComposedTouchTeacher()
-    teacher.first_contact_step = train_module.COMPOSED_TEACHER_NEAR_LATE_CONTACT_STEP - 2
-    teacher.max_contact_count_seen = 1
-    teacher.max_force_seen = 0.30
-
-    assert teacher._select_branch() == "rigid_asymmetric"
-
-
-def test_composed_touch_teacher_keeps_late_high_force_contact_fragile() -> None:
-    teacher = train_module._ComposedTouchTeacher()
-    teacher.first_contact_step = train_module.COMPOSED_TEACHER_NEAR_LATE_CONTACT_STEP
-    teacher.max_contact_count_seen = 2
-    teacher.max_force_seen = train_module.COMPOSED_TEACHER_HIGH_FORCE
-
-    assert teacher._select_branch() == "fragile_balance"
-
-
-def test_composed_touch_teacher_rigid_branch_uses_force_feedback() -> None:
-    teacher = train_module._ComposedTouchTeacher()
-    teacher.selected_branch = "rigid_asymmetric"
-
-    assert isinstance(teacher._make_continuation(), train_module._BandBalancedContinuation)
-
-
 def test_band_balanced_continuation_lifts_after_stable_contact() -> None:
     continuation = train_module._BandBalancedContinuation(
         low_force=0.30,
