@@ -75,14 +75,13 @@ COMPOSED_TEACHER_PROBE_STEPS = 74
 COMPOSED_TEACHER_CONTACT_DWELL_STEPS = 2
 COMPOSED_TEACHER_TWO_CONTACT_DWELL_STEPS = 3
 COMPOSED_TEACHER_SINGLE_CONTACT_DWELL_STEPS = 8
-COMPOSED_TEACHER_CONTACT_PROBE_RATE = 0.14
-COMPOSED_TEACHER_CONTACT_TRIM_RATE = 0.06
+COMPOSED_TEACHER_CONTACT_PROBE_RATE = 0.08
+COMPOSED_TEACHER_CONTACT_TRIM_RATE = 0.04
 COMPOSED_TEACHER_PROBE_RELEASE_RATE = 0.08
 COMPOSED_TEACHER_PROBE_FORCE_FLOOR = 0.16
 COMPOSED_TEACHER_PROBE_FORCE_CEILING = 0.38
 COMPOSED_TEACHER_HIGH_FORCE = 0.42
 COMPOSED_TEACHER_LATE_CONTACT_STEP = 57
-COMPOSED_TEACHER_NEAR_LATE_CONTACT_STEP = 50
 COMPOSED_TEACHER_SPREAD_THRESHOLD = 0.34
 COMPOSED_TEACHER_MANY_CONTACTS = 3
 TOUCH_TEACHER_MODES = (
@@ -479,15 +478,10 @@ class _ComposedTouchTeacher:
                 spent_budget=spent_budget,
             )
         if self.selected_branch == "rigid_asymmetric":
-            return _BandBalancedContinuation(
-                low_force=0.70,
-                high_force=1.20,
-                close_rate=0.14,
-                trim_close_rate=0.08,
-                release_rate=0.10,
-                lift_rate=0.65,
-                stable_steps_required=3,
-                max_acquire_steps=38,
+            return _BudgetContinuation(
+                phases=((0.20, 80),),
+                lift_rate=0.70,
+                spent_budget=spent_budget,
             )
         if self.selected_branch == "slippery_retention":
             return _BandBalancedContinuation(
@@ -511,12 +505,7 @@ class _ComposedTouchTeacher:
         final_contacts = int(np.count_nonzero(self.final_forces >= WARM_START_CONTACT_THRESHOLD))
         force_spread = float(np.ptp(self.final_forces))
         if self.max_contact_count_seen <= 1:
-            if (
-                self.max_force_seen >= COMPOSED_TEACHER_HIGH_FORCE
-                or first_contact >= COMPOSED_TEACHER_LATE_CONTACT_STEP
-            ):
-                return "fragile_balance"
-            return "rigid_asymmetric"
+            return "fragile_balance"
         if first_contact >= COMPOSED_TEACHER_LATE_CONTACT_STEP:
             if (
                 self.max_force_seen >= COMPOSED_TEACHER_HIGH_FORCE
@@ -524,11 +513,6 @@ class _ComposedTouchTeacher:
                 or final_contacts >= 2
             ):
                 return "round_retention"
-            return "fragile_balance"
-        if (
-            self.max_force_seen >= COMPOSED_TEACHER_HIGH_FORCE
-            and first_contact >= COMPOSED_TEACHER_NEAR_LATE_CONTACT_STEP
-        ):
             return "fragile_balance"
         if (
             self.max_force_seen >= COMPOSED_TEACHER_HIGH_FORCE
