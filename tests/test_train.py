@@ -133,6 +133,37 @@ def test_sac_bc_anchor_requires_warm_start_demonstrations() -> None:
         )
 
 
+def test_zero_step_training_is_reserved_for_warm_start_gates() -> None:
+    config = TrainingConfig("ppo", total_timesteps=0, warm_start_transitions=1)
+    assert config.total_timesteps == 0
+    with pytest.raises(ValueError, match="total_timesteps=0 requires"):
+        TrainingConfig("ppo", total_timesteps=0)
+    with pytest.raises(ValueError, match="total_timesteps cannot be negative"):
+        TrainingConfig("ppo", total_timesteps=-1)
+
+
+def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
+    assert TrainingConfig("ppo").warm_start_teacher == "safe_force"
+    assert TrainingConfig("ppo", warm_start_teacher="composed_touch").warm_start_teacher == (
+        "composed_touch"
+    )
+    assert train_module._warm_start_curriculum_stages(TrainingConfig("ppo")) == ("upright",)
+    assert train_module._warm_start_curriculum_stages(
+        TrainingConfig("ppo", warm_start_profile="fragile_mix")
+    ) == ("upright", "fragile_upright")
+    assert train_module._warm_start_curriculum_stages(
+        TrainingConfig(
+            "ppo",
+            curriculum_stage="fragile_upright",
+            warm_start_profile="fragile_mix",
+        )
+    ) == ("fragile_upright",)
+    with pytest.raises(ValueError, match="Unsupported warm-start teacher"):
+        TrainingConfig("ppo", warm_start_teacher="oracle")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unsupported warm-start profile"):
+        TrainingConfig("ppo", warm_start_profile="oracle")  # type: ignore[arg-type]
+
+
 def test_sac_bc_anchor_configuration_attaches_demonstrations() -> None:
     class DummyAnchoredSac:
         def __init__(self) -> None:
@@ -188,6 +219,24 @@ def test_history_safe_force_teacher_uses_only_policy_observation_history() -> No
     release_action = train_module._history_safe_force_teacher_action(frames.reshape(-1))
     assert release_action[0] == 1.0
     assert release_action[1] < 0.0
+
+
+def test_composed_touch_teacher_starts_from_policy_observation_history() -> None:
+    teacher = train_module._ComposedTouchTeacher()
+    stacked = np.zeros((8, 45), dtype=np.float32).reshape(-1)
+    first_action = teacher.act(stacked)
+    np.testing.assert_array_equal(
+        first_action, np.array([0.0, 0.26, 0.26, 0.26], dtype=np.float32)
+    )
+
+    contacted = np.zeros((8, 45), dtype=np.float32)
+    contacted[-1, 12] = 0.50 / 5.0
+    contacted[-1, 21] = 0.50 / 5.0
+    contacted[-1, 30] = 0.50 / 5.0
+    for _ in range(3):
+        action = teacher.act(contacted.reshape(-1))
+    assert action[0] >= 0.0
+    assert teacher.selected_branch in {"orange", "toy_car", "soap_bar", "tomato"}
 
 
 def test_learned_policy_evaluation_uses_360_values_and_writes_reports(tmp_path) -> None:
