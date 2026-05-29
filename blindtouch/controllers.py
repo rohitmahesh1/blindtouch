@@ -288,12 +288,16 @@ class OracleDebugController:
     _stable_steps: int = field(init=False, default=0)
     _lifting: bool = field(init=False, default=False)
     _safe_force: float = field(init=False, default=0.0)
+    _active_lift_rate: float = field(init=False, default=1.0)
 
     _DEMO_PHASES = {
-        "orange": ((0.25, 66),),
+        "orange": ((0.26, 63),),
         "soap_bar": ((0.20, 84),),
         "tomato": ((0.40, 38), (0.05, 23)),
         "toy_car": ((0.20, 80),),
+    }
+    _DEMO_LIFT_RATES = {
+        "orange": 0.70,
     }
 
     def reset(self, observation: Observation, info: Mapping[str, Any]) -> None:
@@ -311,6 +315,7 @@ class OracleDebugController:
             self._phases = ()
         self._safe_force = float(params["safe_force"])
         self._force_target = self._safe_force * 0.55
+        self._active_lift_rate = self._DEMO_LIFT_RATES.get(name, self.lift_rate)
         self._stable_steps = 0
         self._lifting = False
         self._step = 0
@@ -340,7 +345,7 @@ class OracleDebugController:
                     np.where(pad_forces > self._safe_force * 0.94, -0.04, 0.0),
                 ).astype(np.float32)
             self._step += 1
-            return np.r_[float(self._lifting), fingers].astype(np.float32)
+            return np.r_[float(self._lifting) * self._active_lift_rate, fingers].astype(np.float32)
         if self._phase < len(self._phases):
             close_rate, close_steps = self._phases[self._phase]
             if self._phase_step < close_steps:
@@ -351,7 +356,7 @@ class OracleDebugController:
             self._phase_step = 0
             return self.act(np.zeros(45, dtype=np.float32), {})
         self._step += 1
-        return _action(palm=self.lift_rate)
+        return _action(palm=self._active_lift_rate)
 
 
 __all__ = [
