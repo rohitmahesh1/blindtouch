@@ -15,7 +15,7 @@ import random
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping, Protocol
+from typing import Any, Iterable, Literal, Mapping, Protocol, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -269,6 +269,9 @@ class _WarmStartDemoBucket:
     weight: float
     sampling_config: SamplingConfig
     accept_outcomes: tuple[str, ...] | None = None
+    accept_branches: tuple[str, ...] | None = None
+    reject_branches: tuple[str, ...] = ()
+    min_accepted_episodes: int = 0
     seed_offset: int = 17_000
 
 
@@ -1253,37 +1256,49 @@ def _collect_demo_bucket(
                 "bucket": bucket.name,
                 "target_transitions": 0,
                 "collected_transitions": 0,
+                "raw_collected_transitions": 0,
                 "attempts": 0,
                 "accepted_episodes": 0,
+                "min_accepted_episodes": bucket.min_accepted_episodes,
                 "accept_outcomes": (
                     list(bucket.accept_outcomes) if bucket.accept_outcomes else "all"
                 ),
+                "accept_branches": (
+                    list(bucket.accept_branches) if bucket.accept_branches else "all"
+                ),
+                "reject_branches": list(bucket.reject_branches),
                 "outcomes": {},
                 "accepted_outcomes": {},
                 "branches": {},
                 "accepted_branches": {},
+                "branch_rejections": {},
                 "accepted_families": {},
                 "accepted_poses": {},
             },
         )
 
-    observations: list[Observation] = []
-    actions: list[Action] = []
+    observation_chunks: list[list[Observation]] = []
+    action_chunks: list[list[Action]] = []
     attempts = 0
     accepted = 0
+    collected_transitions = 0
     outcomes: dict[str, int] = {}
     accepted_outcomes: dict[str, int] = {}
     accepted_families: dict[str, int] = {}
     accepted_poses: dict[str, int] = {}
     branches: dict[str, int] = {}
     accepted_branches: dict[str, int] = {}
+    branch_rejections: dict[str, int] = {}
     max_attempts = max(500, target_transitions)
     env = ObservationHistory(
         BlindTouchEnv(config=POLICY_ENV_CONFIG, sampling_config=bucket.sampling_config),
         history_length=history_length,
     )
     try:
-        while len(observations) < target_transitions and attempts < max_attempts:
+        while (
+            (collected_transitions < target_transitions)
+            or (accepted < bucket.min_accepted_episodes)
+        ) and attempts < max_attempts:
             stacked_observation, _ = env.reset(seed=seed + attempts)
             teacher = _ComposedTouchTeacher()
             episode_observations: list[Observation] = []
@@ -1301,6 +1316,12 @@ def _collect_demo_bucket(
             branch = teacher.selected_branch or "probe_only"
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
             branches[branch] = branches.get(branch, 0) + 1
+            if bucket.accept_branches is not None and branch not in bucket.accept_branches:
+                branch_rejections[branch] = branch_rejections.get(branch, 0) + 1
+                continue
+            if branch in bucket.reject_branches:
+                branch_rejections[branch] = branch_rejections.get(branch, 0) + 1
+                continue
             if bucket.accept_outcomes is not None and outcome not in bucket.accept_outcomes:
                 continue
 
@@ -1315,36 +1336,109 @@ def _collect_demo_bucket(
                 accepted_poses[episode_object.pose] = (
                     accepted_poses.get(episode_object.pose, 0) + 1
                 )
-            observations.extend(episode_observations)
-            actions.extend(episode_actions)
+            observation_chunks.append(episode_observations)
+            action_chunks.append(episode_actions)
+            collected_transitions += len(episode_observations)
     finally:
         env.close()
 
-    if len(observations) < target_transitions:
+    if collected_transitions < target_transitions:
         raise RuntimeError(
-            f"{bucket.name} collected only {len(observations)}/{target_transitions} "
+            f"{bucket.name} collected only {collected_transitions}/{target_transitions} "
             f"transitions after {attempts} attempts; outcomes={outcomes}; "
             f"accepted_outcomes={accepted_outcomes}"
         )
+    if accepted < bucket.min_accepted_episodes:
+        raise RuntimeError(
+            f"{bucket.name} accepted only {accepted}/{bucket.min_accepted_episodes} "
+            f"episodes after {attempts} attempts; outcomes={outcomes}; "
+            f"branches={branches}; branch_rejections={branch_rejections}"
+        )
+
+    observations, actions = _select_demo_bucket_transitions(
+        observation_chunks,
+        action_chunks,
+        target_transitions,
+        balanced=bucket.min_accepted_episodes > 0,
+    )
 
     stats = {
         "bucket": bucket.name,
         "target_transitions": target_transitions,
         "collected_transitions": target_transitions,
+        "raw_collected_transitions": collected_transitions,
         "attempts": attempts,
         "accepted_episodes": accepted,
+        "min_accepted_episodes": bucket.min_accepted_episodes,
         "accept_outcomes": list(bucket.accept_outcomes) if bucket.accept_outcomes else "all",
+        "accept_branches": list(bucket.accept_branches) if bucket.accept_branches else "all",
+        "reject_branches": list(bucket.reject_branches),
         "outcomes": outcomes,
         "accepted_outcomes": accepted_outcomes,
         "branches": branches,
         "accepted_branches": accepted_branches,
+        "branch_rejections": branch_rejections,
         "accepted_families": accepted_families,
         "accepted_poses": accepted_poses,
     }
     return (
-        np.asarray(observations[:target_transitions], dtype=np.float32),
-        np.asarray(actions[:target_transitions], dtype=np.float32),
+        observations,
+        actions,
         stats,
+    )
+
+
+def _select_demo_bucket_transitions(
+    observation_chunks: Sequence[Sequence[Observation]],
+    action_chunks: Sequence[Sequence[Action]],
+    target_transitions: int,
+    *,
+    balanced: bool,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    if len(observation_chunks) != len(action_chunks):
+        raise ValueError("observation and action chunks must have the same length")
+    if not balanced:
+        observations = [
+            observation
+            for episode_observations in observation_chunks
+            for observation in episode_observations
+        ]
+        actions = [action for episode_actions in action_chunks for action in episode_actions]
+        return (
+            np.asarray(observations[:target_transitions], dtype=np.float32),
+            np.asarray(actions[:target_transitions], dtype=np.float32),
+        )
+
+    episode_count = len(observation_chunks)
+    base_quota, remainder = divmod(target_transitions, episode_count)
+    selected_observations: list[Observation] = []
+    selected_actions: list[Action] = []
+    for episode_index, (episode_observations, episode_actions) in enumerate(
+        zip(observation_chunks, action_chunks, strict=True)
+    ):
+        quota = base_quota + int(episode_index < remainder)
+        if quota <= 0:
+            continue
+        take = min(quota, len(episode_observations))
+        indices = np.linspace(0, len(episode_observations) - 1, take, dtype=np.int64)
+        selected_observations.extend(episode_observations[index] for index in indices)
+        selected_actions.extend(episode_actions[index] for index in indices)
+
+    if len(selected_observations) < target_transitions:
+        for episode_observations, episode_actions in zip(
+            observation_chunks, action_chunks, strict=True
+        ):
+            for observation, action in zip(episode_observations, episode_actions, strict=True):
+                selected_observations.append(observation)
+                selected_actions.append(action)
+                if len(selected_observations) >= target_transitions:
+                    break
+            if len(selected_observations) >= target_transitions:
+                break
+
+    return (
+        np.asarray(selected_observations[:target_transitions], dtype=np.float32),
+        np.asarray(selected_actions[:target_transitions], dtype=np.float32),
     )
 
 
@@ -1355,12 +1449,13 @@ def _stratified_quality_demo_buckets(
     return (
         _WarmStartDemoBucket(
             "stage_core",
-            0.95,
+            0.84,
             curriculum_sampling_config(config.curriculum_stage),
+            reject_branches=("fragile_balance",),
         ),
         _WarmStartDemoBucket(
             "fragile_low_margin_success",
-            0.017,
+            0.06,
             SamplingConfig(
                 training_families=("fragile",),
                 allowed_poses=("upright", "side_x", "side_y"),
@@ -1372,11 +1467,29 @@ def _stratified_quality_demo_buckets(
                 holding_force_margin=0.75,
             ),
             accept_outcomes=success,
+            min_accepted_episodes=8,
             seed_offset=43_000,
         ),
         _WarmStartDemoBucket(
+            "rounded_retention_success",
+            0.04,
+            SamplingConfig(
+                training_families=("rounded",),
+                allowed_poses=("upright", "side_x", "side_y"),
+                offset_range=(-0.004, 0.004),
+                friction_range=(0.35, 1.10),
+                mass_range=(0.035, 0.130),
+                safe_force_margin=2.6,
+                nominal_pad_force_capacity=0.65,
+                holding_force_margin=0.80,
+            ),
+            accept_outcomes=success,
+            min_accepted_episodes=8,
+            seed_offset=48_000,
+        ),
+        _WarmStartDemoBucket(
             "slippery_gap_success",
-            0.017,
+            0.03,
             SamplingConfig(
                 training_families=("slippery",),
                 allowed_poses=("upright", "side_x", "side_y"),
@@ -1388,11 +1501,12 @@ def _stratified_quality_demo_buckets(
                 holding_force_margin=0.85,
             ),
             accept_outcomes=success,
+            min_accepted_episodes=6,
             seed_offset=53_000,
         ),
         _WarmStartDemoBucket(
             "rigid_side_gap_success",
-            0.016,
+            0.03,
             SamplingConfig(
                 training_families=("container", "package", "chassis"),
                 allowed_poses=("upright", "side_x", "side_y", "wheels_down"),
@@ -1404,6 +1518,7 @@ def _stratified_quality_demo_buckets(
                 holding_force_margin=0.80,
             ),
             accept_outcomes=success,
+            min_accepted_episodes=6,
             seed_offset=63_000,
         ),
     )
