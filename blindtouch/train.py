@@ -41,7 +41,7 @@ EvaluationSuiteName = Literal[
     "validation_procedural", "test_procedural_holdout", "test_pose", "test_stress"
 ]
 WarmStartTeacherName = Literal["safe_force", "composed_touch"]
-WarmStartProfileName = Literal["stage", "fragile_mix"]
+WarmStartProfileName = Literal["stage", "fragile_mix", "stratified_quality"]
 WarmStartValidationSuiteName = EvaluationSuiteName
 Observation = NDArray[np.float32]
 Action = NDArray[np.float32]
@@ -183,7 +183,7 @@ class TrainingConfig:
             raise ValueError("total_timesteps=0 requires warm_start_transitions")
         if self.warm_start_teacher not in {"safe_force", "composed_touch"}:
             raise ValueError(f"Unsupported warm-start teacher: {self.warm_start_teacher!r}")
-        if self.warm_start_profile not in {"stage", "fragile_mix"}:
+        if self.warm_start_profile not in {"stage", "fragile_mix", "stratified_quality"}:
             raise ValueError(f"Unsupported warm-start profile: {self.warm_start_profile!r}")
         if self.warm_start_epochs < 1:
             raise ValueError("warm_start_epochs must be positive")
@@ -259,6 +259,17 @@ class CheckpointEvaluation:
     report_paths: dict[str, Path]
     summaries: dict[str, Any]
     summary_path: Path
+
+
+@dataclass(frozen=True)
+class _WarmStartDemoBucket:
+    """One offline demonstration source for behavior-cloning warm starts."""
+
+    name: str
+    weight: float
+    sampling_config: SamplingConfig
+    accept_outcomes: tuple[str, ...] | None = None
+    seed_offset: int = 17_000
 
 
 class StackedPolicyController:
@@ -1092,6 +1103,9 @@ def _collect_safe_force_demonstrations(
 def _collect_composed_touch_demonstrations(
     config: TrainingConfig,
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    if config.warm_start_profile == "stratified_quality":
+        return _collect_stratified_quality_demonstrations(config)
+
     observations: list[Observation] = []
     actions: list[Action] = []
     stages = _warm_start_curriculum_stages(config)
@@ -1123,11 +1137,209 @@ def _collect_composed_touch_demonstrations(
     )
 
 
+def _collect_stratified_quality_demonstrations(
+    config: TrainingConfig,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    buckets = _stratified_quality_demo_buckets(config)
+    quotas = _transition_quotas(config.warm_start_transitions, buckets)
+    observation_chunks: list[NDArray[np.float32]] = []
+    action_chunks: list[NDArray[np.float32]] = []
+    stats: list[dict[str, Any]] = []
+    for bucket in buckets:
+        observations, actions, bucket_stats = _collect_demo_bucket(
+            bucket,
+            target_transitions=quotas[bucket.name],
+            seed=config.seed + bucket.seed_offset,
+            history_length=config.history_length,
+        )
+        observation_chunks.append(observations)
+        action_chunks.append(actions)
+        stats.append(bucket_stats)
+
+    print("WARM_START_DEMO_STATS " + json.dumps(stats, sort_keys=True), flush=True)
+    return (
+        np.concatenate(observation_chunks, axis=0).astype(np.float32),
+        np.concatenate(action_chunks, axis=0).astype(np.float32),
+    )
+
+
+def _collect_demo_bucket(
+    bucket: _WarmStartDemoBucket,
+    *,
+    target_transitions: int,
+    seed: int,
+    history_length: int,
+) -> tuple[NDArray[np.float32], NDArray[np.float32], dict[str, Any]]:
+    if target_transitions == 0:
+        return (
+            np.empty((0, history_length * BASE_OBSERVATION_SIZE), dtype=np.float32),
+            np.empty((0, 4), dtype=np.float32),
+            {
+                "bucket": bucket.name,
+                "target_transitions": 0,
+                "collected_transitions": 0,
+                "attempts": 0,
+                "accepted_episodes": 0,
+                "accept_outcomes": (
+                    list(bucket.accept_outcomes) if bucket.accept_outcomes else "all"
+                ),
+                "outcomes": {},
+                "accepted_outcomes": {},
+                "accepted_families": {},
+                "accepted_poses": {},
+            },
+        )
+
+    observations: list[Observation] = []
+    actions: list[Action] = []
+    attempts = 0
+    accepted = 0
+    outcomes: dict[str, int] = {}
+    accepted_outcomes: dict[str, int] = {}
+    accepted_families: dict[str, int] = {}
+    accepted_poses: dict[str, int] = {}
+    max_attempts = max(500, target_transitions)
+    env = ObservationHistory(
+        BlindTouchEnv(config=POLICY_ENV_CONFIG, sampling_config=bucket.sampling_config),
+        history_length=history_length,
+    )
+    try:
+        while len(observations) < target_transitions and attempts < max_attempts:
+            stacked_observation, _ = env.reset(seed=seed + attempts)
+            teacher = _ComposedTouchTeacher()
+            episode_observations: list[Observation] = []
+            episode_actions: list[Action] = []
+            while True:
+                action = teacher.act(stacked_observation)
+                episode_observations.append(stacked_observation.copy())
+                episode_actions.append(action.copy())
+                stacked_observation, _, terminated, truncated, info = env.step(action)
+                if terminated or truncated:
+                    break
+
+            attempts += 1
+            outcome = str(info["outcome"])
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            if bucket.accept_outcomes is not None and outcome not in bucket.accept_outcomes:
+                continue
+
+            accepted += 1
+            accepted_outcomes[outcome] = accepted_outcomes.get(outcome, 0) + 1
+            episode_object = env.unwrapped.object_params
+            if episode_object is not None:
+                accepted_families[episode_object.family] = (
+                    accepted_families.get(episode_object.family, 0) + 1
+                )
+                accepted_poses[episode_object.pose] = (
+                    accepted_poses.get(episode_object.pose, 0) + 1
+                )
+            observations.extend(episode_observations)
+            actions.extend(episode_actions)
+    finally:
+        env.close()
+
+    if len(observations) < target_transitions:
+        raise RuntimeError(
+            f"{bucket.name} collected only {len(observations)}/{target_transitions} "
+            f"transitions after {attempts} attempts; outcomes={outcomes}; "
+            f"accepted_outcomes={accepted_outcomes}"
+        )
+
+    stats = {
+        "bucket": bucket.name,
+        "target_transitions": target_transitions,
+        "collected_transitions": target_transitions,
+        "attempts": attempts,
+        "accepted_episodes": accepted,
+        "accept_outcomes": list(bucket.accept_outcomes) if bucket.accept_outcomes else "all",
+        "outcomes": outcomes,
+        "accepted_outcomes": accepted_outcomes,
+        "accepted_families": accepted_families,
+        "accepted_poses": accepted_poses,
+    }
+    return (
+        np.asarray(observations[:target_transitions], dtype=np.float32),
+        np.asarray(actions[:target_transitions], dtype=np.float32),
+        stats,
+    )
+
+
+def _stratified_quality_demo_buckets(
+    config: TrainingConfig,
+) -> tuple[_WarmStartDemoBucket, ...]:
+    success = ("success",)
+    return (
+        _WarmStartDemoBucket(
+            "stage_core",
+            0.95,
+            curriculum_sampling_config(config.curriculum_stage),
+        ),
+        _WarmStartDemoBucket(
+            "fragile_low_margin_success",
+            0.017,
+            SamplingConfig(
+                training_families=("fragile",),
+                allowed_poses=("upright", "side_x", "side_y"),
+                offset_range=(-0.004, 0.004),
+                friction_range=(0.65, 1.20),
+                mass_range=(0.025, 0.085),
+                safe_force_headroom_range=(2.0, 3.1),
+                nominal_pad_force_capacity=0.55,
+                holding_force_margin=0.75,
+            ),
+            accept_outcomes=success,
+            seed_offset=43_000,
+        ),
+        _WarmStartDemoBucket(
+            "slippery_gap_success",
+            0.017,
+            SamplingConfig(
+                training_families=("slippery",),
+                allowed_poses=("upright", "side_x", "side_y"),
+                offset_range=(-0.004, 0.004),
+                friction_range=(0.16, 0.32),
+                mass_range=(0.030, 0.120),
+                safe_force_margin=2.4,
+                nominal_pad_force_capacity=0.75,
+                holding_force_margin=0.85,
+            ),
+            accept_outcomes=success,
+            seed_offset=53_000,
+        ),
+        _WarmStartDemoBucket(
+            "rigid_side_gap_success",
+            0.016,
+            SamplingConfig(
+                training_families=("container", "package", "chassis"),
+                allowed_poses=("upright", "side_x", "side_y", "wheels_down"),
+                offset_range=(-0.004, 0.004),
+                friction_range=(0.30, 1.20),
+                mass_range=(0.040, 0.180),
+                safe_force_margin=2.5,
+                nominal_pad_force_capacity=0.65,
+                holding_force_margin=0.80,
+            ),
+            accept_outcomes=success,
+            seed_offset=63_000,
+        ),
+    )
+
+
+def _transition_quotas(
+    total: int, buckets: tuple[_WarmStartDemoBucket, ...]
+) -> dict[str, int]:
+    quotas = {bucket.name: int(total * bucket.weight) for bucket in buckets}
+    quotas[buckets[0].name] += total - sum(quotas.values())
+    return quotas
+
+
 def _warm_start_curriculum_stages(config: TrainingConfig) -> tuple[CurriculumStage, ...]:
     if config.warm_start_profile == "stage":
         return (config.curriculum_stage,)
     if config.warm_start_profile == "fragile_mix":
         return tuple(dict.fromkeys((config.curriculum_stage, "fragile_upright")))
+    if config.warm_start_profile == "stratified_quality":
+        return (config.curriculum_stage,)
     raise ValueError(f"Unsupported warm-start profile: {config.warm_start_profile!r}")
 
 
@@ -1437,7 +1649,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--warm-start-profile",
-        choices=("stage", "fragile_mix"),
+        choices=("stage", "fragile_mix", "stratified_quality"),
         default="stage",
         help="Object distribution used for collecting warm-start demonstrations.",
     )
