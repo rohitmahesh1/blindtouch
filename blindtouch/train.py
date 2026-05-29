@@ -73,13 +73,6 @@ WARM_START_LATE_LIFT_STEP = 125
 COMPOSED_TEACHER_PROBE_RATE = 0.26
 COMPOSED_TEACHER_PROBE_STEPS = 74
 COMPOSED_TEACHER_CONTACT_DWELL_STEPS = 2
-COMPOSED_TEACHER_TWO_CONTACT_DWELL_STEPS = 3
-COMPOSED_TEACHER_SINGLE_CONTACT_DWELL_STEPS = 8
-COMPOSED_TEACHER_CONTACT_PROBE_RATE = 0.08
-COMPOSED_TEACHER_CONTACT_TRIM_RATE = 0.04
-COMPOSED_TEACHER_PROBE_RELEASE_RATE = 0.08
-COMPOSED_TEACHER_PROBE_FORCE_FLOOR = 0.16
-COMPOSED_TEACHER_PROBE_FORCE_CEILING = 0.38
 COMPOSED_TEACHER_HIGH_FORCE = 0.42
 COMPOSED_TEACHER_LATE_CONTACT_STEP = 57
 COMPOSED_TEACHER_SPREAD_THRESHOLD = 0.34
@@ -357,82 +350,28 @@ class _SequenceContinuation:
         return np.array([self.lift_rate, 0.0, 0.0, 0.0], dtype=np.float32)
 
 
-class _BandBalancedContinuation:
-    """Balance observable fingertip force inside a band before lifting."""
-
-    def __init__(
-        self,
-        *,
-        low_force: float,
-        high_force: float,
-        close_rate: float,
-        trim_close_rate: float,
-        release_rate: float,
-        lift_rate: float,
-        stable_steps_required: int,
-        max_acquire_steps: int,
-        min_contacts: int = 2,
-    ) -> None:
-        self.low_force = low_force
-        self.high_force = high_force
-        self.close_rate = close_rate
-        self.trim_close_rate = trim_close_rate
-        self.release_rate = release_rate
-        self.lift_rate = lift_rate
-        self.stable_steps_required = stable_steps_required
-        self.max_acquire_steps = max_acquire_steps
-        self.min_contacts = min_contacts
-        self.acquire_step = 0
-        self.stable_steps = 0
-        self.lifting = False
-
-    def act(self, observation: Observation) -> Action:
-        forces = per_finger_max_taxel_force(observation)
-        contact_count = int(np.count_nonzero(forces >= WARM_START_CONTACT_THRESHOLD))
-        ready_count = int(np.count_nonzero(forces >= self.low_force))
-        balanced = bool(ready_count >= self.min_contacts and np.max(forces) <= self.high_force)
-        self.stable_steps = self.stable_steps + 1 if balanced else 0
-        self.lifting = self.lifting or (
-            self.stable_steps >= self.stable_steps_required
-            or (
-                self.acquire_step >= self.max_acquire_steps
-                and contact_count >= self.min_contacts
-            )
-        )
-        finger_actions = self._finger_actions(forces, lifting=self.lifting)
-        self.acquire_step += 1
-        return np.r_[self.lift_rate if self.lifting else 0.0, finger_actions].astype(np.float32)
-
-    def _finger_actions(self, forces: NDArray[np.float32], *, lifting: bool) -> NDArray[np.float32]:
-        force_floor = self.low_force * (0.80 if lifting else 1.0)
-        return np.where(
-            forces < WARM_START_CONTACT_THRESHOLD,
-            self.close_rate,
-            np.where(
-                forces < force_floor,
-                self.trim_close_rate,
-                np.where(forces > self.high_force, -self.release_rate, 0.0),
-            ),
-        ).astype(np.float32)
-
-
 class _FragileBalancedContinuation:
     """Low-force per-finger balancing branch for fragile tactile modes."""
 
     def __init__(self) -> None:
-        self._controller = _BandBalancedContinuation(
-            low_force=0.30,
-            high_force=0.48,
-            close_rate=0.06,
-            trim_close_rate=0.04,
-            release_rate=0.08,
-            lift_rate=0.45,
-            stable_steps_required=3,
-            max_acquire_steps=42,
-        )
+        self.acquire_step = 0
+        self.acquire_steps = 24
 
     def act(self, observation: Observation) -> Action:
-        return self._controller.act(observation)
+        forces = per_finger_max_taxel_force(observation)
+        if float(np.max(forces)) > 0.50:
+            finger_actions = np.full(3, -0.02, dtype=np.float32)
+        else:
+            close_rate = 0.05 if self.acquire_step < self.acquire_steps else 0.04
+            finger_actions = np.where(
+                forces < 0.46,
+                close_rate,
+                np.where(forces > 0.50, -0.02, 0.0),
+            ).astype(np.float32)
+        if self.acquire_step < self.acquire_steps:
+            self.acquire_step += 1
+            return np.r_[0.0, finger_actions].astype(np.float32)
+        return np.r_[0.32, finger_actions].astype(np.float32)
 
 
 class _ComposedTouchTeacher:
@@ -449,7 +388,6 @@ class _ComposedTouchTeacher:
         self.first_three_contact_step: int | None = None
         self.max_force_seen = 0.0
         self.max_contact_count_seen = 0
-        self.probe_close_budget = 0.0
         self.final_forces = np.zeros(3, dtype=np.float32)
         self.selected_branch: str | None = None
         self.continuation: Any | None = None
@@ -459,10 +397,9 @@ class _ComposedTouchTeacher:
         self._update_touch_history(observation)
         if self.continuation is None:
             if not self._probe_complete():
-                action = self._probe_action(observation)
-                self.probe_close_budget += float(np.mean(np.maximum(action[1:], 0.0)))
                 self.step += 1
-                return action
+                rate = COMPOSED_TEACHER_PROBE_RATE
+                return np.array([0.0, rate, rate, rate], dtype=np.float32)
             self.selected_branch = self._select_branch()
             self.continuation = self._make_continuation()
 
@@ -470,7 +407,7 @@ class _ComposedTouchTeacher:
         return self.continuation.act(observation)
 
     def _make_continuation(self) -> Any:
-        spent_budget = self.probe_close_budget
+        spent_budget = COMPOSED_TEACHER_PROBE_RATE * self.step
         if self.selected_branch == "round_retention":
             return _BudgetContinuation(
                 phases=((0.26, 63),),
@@ -484,16 +421,7 @@ class _ComposedTouchTeacher:
                 spent_budget=spent_budget,
             )
         if self.selected_branch == "slippery_retention":
-            return _BandBalancedContinuation(
-                low_force=0.55,
-                high_force=0.95,
-                close_rate=0.12,
-                trim_close_rate=0.06,
-                release_rate=0.08,
-                lift_rate=0.55,
-                stable_steps_required=3,
-                max_acquire_steps=36,
-            )
+            return _SequenceContinuation(close_rate=0.10, close_steps=24, lift_rate=0.35)
         if self.selected_branch == "fragile_balance":
             return _FragileBalancedContinuation()
         raise AssertionError(self.selected_branch)
@@ -504,13 +432,10 @@ class _ComposedTouchTeacher:
         first_contact = self.first_contact_step
         final_contacts = int(np.count_nonzero(self.final_forces >= WARM_START_CONTACT_THRESHOLD))
         force_spread = float(np.ptp(self.final_forces))
-        if self.max_contact_count_seen <= 1:
-            return "fragile_balance"
         if first_contact >= COMPOSED_TEACHER_LATE_CONTACT_STEP:
             if (
                 self.max_force_seen >= COMPOSED_TEACHER_HIGH_FORCE
-                or self.max_contact_count_seen >= COMPOSED_TEACHER_MANY_CONTACTS
-                or final_contacts >= 2
+                or final_contacts >= COMPOSED_TEACHER_MANY_CONTACTS
             ):
                 return "round_retention"
             return "fragile_balance"
@@ -526,35 +451,7 @@ class _ComposedTouchTeacher:
             return True
         if self.first_contact_step is None:
             return False
-        if self.max_force_seen >= COMPOSED_TEACHER_HIGH_FORCE:
-            return self.step >= self.first_contact_step + COMPOSED_TEACHER_CONTACT_DWELL_STEPS
-        if self.first_two_contact_step is not None:
-            return self.step >= (
-                self.first_two_contact_step + COMPOSED_TEACHER_TWO_CONTACT_DWELL_STEPS
-            )
-        return self.step >= (
-            self.first_contact_step + COMPOSED_TEACHER_SINGLE_CONTACT_DWELL_STEPS
-        )
-
-    def _probe_action(self, observation: Observation) -> Action:
-        if self.first_contact_step is None:
-            rate = COMPOSED_TEACHER_PROBE_RATE
-            return np.array([0.0, rate, rate, rate], dtype=np.float32)
-        forces = per_finger_max_taxel_force(observation)
-        finger_actions = np.where(
-            forces < WARM_START_CONTACT_THRESHOLD,
-            COMPOSED_TEACHER_CONTACT_PROBE_RATE,
-            np.where(
-                forces < COMPOSED_TEACHER_PROBE_FORCE_FLOOR,
-                COMPOSED_TEACHER_CONTACT_TRIM_RATE,
-                np.where(
-                    forces > COMPOSED_TEACHER_PROBE_FORCE_CEILING,
-                    -COMPOSED_TEACHER_PROBE_RELEASE_RATE,
-                    0.0,
-                ),
-            ),
-        ).astype(np.float32)
-        return np.r_[0.0, finger_actions].astype(np.float32)
+        return self.step >= self.first_contact_step + COMPOSED_TEACHER_CONTACT_DWELL_STEPS
 
     def _update_touch_history(self, observation: Observation) -> None:
         forces = per_finger_max_taxel_force(observation)
