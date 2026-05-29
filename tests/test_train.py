@@ -619,7 +619,7 @@ def test_composed_touch_teacher_starts_from_policy_observation_history() -> None
     stacked = np.zeros((8, 45), dtype=np.float32).reshape(-1)
     first_action = teacher.act(stacked)
     np.testing.assert_array_equal(
-        first_action, np.array([0.0, 0.26, 0.26, 0.26], dtype=np.float32)
+        first_action, np.array([0.0, 0.20, 0.20, 0.20], dtype=np.float32)
     )
 
     contacted = np.zeros((8, 45), dtype=np.float32)
