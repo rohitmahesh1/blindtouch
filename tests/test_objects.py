@@ -100,8 +100,8 @@ def test_demo_objects_lock_household_specs_and_named_poses() -> None:
 
     assert orange.shape == "ellipsoid"
     assert orange.mass == pytest.approx(0.120)
-    assert orange.friction == pytest.approx(0.55)
-    assert orange.safe_force == pytest.approx(0.80)
+    assert orange.friction == pytest.approx(0.69)
+    assert orange.safe_force == pytest.approx(0.92)
     assert soap_edge.shape == "box"
     assert soap_edge.pose == "edge_resting"
     assert tomato.shape == "ellipsoid"
