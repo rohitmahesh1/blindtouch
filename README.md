@@ -18,3 +18,8 @@ Current locked suites:
 The procedural curriculum intentionally covers tactile skills rather than
 named objects: round retention, rigid/asymmetric contact, slippery retention,
 and fragile balance.
+
+Training checkpoints are evaluated on `validation_procedural` and
+`test_procedural_holdout` by default. `best.zip` is promoted by the holdout
+suite, not by household-style demo objects, so the demo path stays separated
+from the tuning path.
