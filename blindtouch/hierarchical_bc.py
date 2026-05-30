@@ -199,6 +199,8 @@ class HierarchicalBCConfig:
     validation_fraction: float = 0.10
     mode_loss_weight: float = 0.25
     action_loss_weight: float = 1.0
+    tactile_action_weight: float = 0.0
+    tactile_action_weight_mode: str = "all"
     seed: int = 0
     device: str = "auto"
 
@@ -215,6 +217,10 @@ class HierarchicalBCConfig:
             raise ValueError("validation_fraction must be in [0, 1)")
         if self.mode_loss_weight < 0.0 or self.action_loss_weight <= 0.0:
             raise ValueError("loss weights must be nonnegative, with positive action weight")
+        if self.tactile_action_weight < 0.0:
+            raise ValueError("tactile_action_weight must be nonnegative")
+        if self.tactile_action_weight_mode != "all" and self.tactile_action_weight_mode not in MODE_TO_ID:
+            raise ValueError("tactile_action_weight_mode must be 'all' or a known mode")
 
 
 @dataclass(frozen=True)
@@ -420,15 +426,48 @@ def _losses_for_batch(
     batch_indices = torch.arange(observations.shape[0], dtype=torch.long, device=policy.device)
     selected_actions = action_heads[batch_indices, mode_ids]
     mode_loss = functional.cross_entropy(mode_logits, mode_ids)
-    action_loss = functional.mse_loss(selected_actions, actions)
-    loss = config.action_loss_weight * action_loss + config.mode_loss_weight * mode_loss
+    per_sample_action_loss = functional.mse_loss(selected_actions, actions, reduction="none").mean(dim=1)
+    action_loss = per_sample_action_loss.mean()
+    action_weights = _action_loss_weights(torch, config, observations, mode_ids)
+    weighted_action_loss = (per_sample_action_loss * action_weights).mean()
+    loss = config.action_loss_weight * weighted_action_loss + config.mode_loss_weight * mode_loss
     mode_accuracy = (torch.argmax(mode_logits, dim=1) == mode_ids).float().mean()
     return {
         "loss": loss,
         "action_loss": action_loss,
+        "weighted_action_loss": weighted_action_loss,
+        "mean_action_weight": action_weights.mean(),
         "mode_loss": mode_loss,
         "mode_accuracy": mode_accuracy,
     }
+
+
+def _action_loss_weights(
+    torch: Any,
+    config: HierarchicalBCConfig,
+    observations: Any,
+    mode_ids: Any,
+) -> Any:
+    if config.tactile_action_weight <= 0.0:
+        return torch.ones(observations.shape[0], dtype=torch.float32, device=observations.device)
+
+    tactile_start = 12
+    tactile_stop = 39
+    observation_frame_size = 45
+    history_length = observations.shape[1] // observation_frame_size
+    tactile_slices = [
+        observations[:, frame * observation_frame_size + tactile_start : frame * observation_frame_size + tactile_stop]
+        for frame in range(history_length)
+    ]
+    tactile_strength = torch.stack(
+        [torch.max(torch.clamp(taxels, min=0.0, max=1.0), dim=1).values for taxels in tactile_slices],
+        dim=1,
+    ).max(dim=1).values
+    weights = 1.0 + float(config.tactile_action_weight) * tactile_strength
+    if config.tactile_action_weight_mode != "all":
+        selected_mode = MODE_TO_ID[config.tactile_action_weight_mode]
+        weights = torch.where(mode_ids == selected_mode, weights, torch.ones_like(weights))
+    return weights
 
 
 def _evaluate_loss_split(
@@ -560,6 +599,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     train_parser.add_argument("--learning-rate", type=float, default=3e-4)
     train_parser.add_argument("--validation-fraction", type=float, default=0.10)
     train_parser.add_argument("--mode-loss-weight", type=float, default=0.25)
+    train_parser.add_argument("--tactile-action-weight", type=float, default=0.0)
+    train_parser.add_argument("--tactile-action-weight-mode", default="all")
     train_parser.add_argument("--seed", type=int, default=0)
     train_parser.add_argument("--device", default="auto")
 
@@ -575,6 +616,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         learning_rate=args.learning_rate,
         validation_fraction=args.validation_fraction,
         mode_loss_weight=args.mode_loss_weight,
+        tactile_action_weight=args.tactile_action_weight,
+        tactile_action_weight_mode=args.tactile_action_weight_mode,
         seed=args.seed,
         device=args.device,
     )
