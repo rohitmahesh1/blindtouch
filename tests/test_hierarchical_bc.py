@@ -117,6 +117,31 @@ def test_hierarchical_bc_trains_mode_head_and_action_heads(tmp_path) -> None:
     np.testing.assert_allclose(loaded_action, action, atol=1e-6)
 
 
+def test_hierarchical_bc_can_weight_tactile_contact_states() -> None:
+    pytest.importorskip("torch")
+    store = _tiny_store(40)
+    fragile_id = MODE_TO_ID["fragile_balance"]
+    fragile_rows = store.mode_ids == fragile_id
+    store.observations[fragile_rows, 12:39] = 1.0
+    config = HierarchicalBCConfig(
+        hidden_sizes=(32,),
+        epochs=1,
+        batch_size=8,
+        learning_rate=1e-2,
+        validation_fraction=0.0,
+        mode_loss_weight=0.0,
+        tactile_action_weight=2.0,
+        tactile_action_weight_mode="fragile_balance",
+        seed=4,
+        device="cpu",
+    )
+
+    result = train_hierarchical_bc(store, config)
+
+    assert result.metrics["train"]["mean_action_weight"] > 1.0
+    assert result.metrics["train"]["weighted_action_loss"] >= result.metrics["train"]["action_loss"]
+
+
 def test_hierarchical_bc_cli_summary(tmp_path, capsys) -> None:
     from blindtouch import hierarchical_bc
 
