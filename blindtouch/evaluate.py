@@ -710,7 +710,7 @@ def _scene_with_claw_left(frame: Frame) -> Frame:
     scale = max(width / source_width, height / source_height)
     scene_width = max(1, int(source_width * scale))
     scene_height = max(1, int(source_height * scale))
-    scene = _resize_nearest(scene_source, scene_height, scene_width)
+    scene = _resize_bilinear(scene_source, scene_height, scene_width)
     left = max(0, (scene_width - width) // 2)
     top = max(0, (scene_height - height) // 2)
     return scene[top : top + height, left : left + width].copy()
@@ -771,17 +771,34 @@ def _blend_panel(
     image[max(y, bottom - 2) : bottom, x:right] = border
 
 
-def _resize_nearest(frame: Frame, height: int, width: int) -> Frame:
+def _resize_bilinear(frame: Frame, height: int, width: int) -> Frame:
     source_height, source_width, _ = frame.shape
-    y_indices = np.minimum(
-        (np.arange(height, dtype=np.float64) * source_height / height).astype(np.int64),
-        source_height - 1,
+    if height == source_height and width == source_width:
+        return frame.copy()
+
+    y_positions = (
+        (np.arange(height, dtype=np.float32) + 0.5) * source_height / height - 0.5
     )
-    x_indices = np.minimum(
-        (np.arange(width, dtype=np.float64) * source_width / width).astype(np.int64),
-        source_width - 1,
+    x_positions = (
+        (np.arange(width, dtype=np.float32) + 0.5) * source_width / width - 0.5
     )
-    return frame[y_indices[:, None], x_indices]
+    y0 = np.floor(np.clip(y_positions, 0.0, source_height - 1.0)).astype(np.int64)
+    x0 = np.floor(np.clip(x_positions, 0.0, source_width - 1.0)).astype(np.int64)
+    y1 = np.minimum(y0 + 1, source_height - 1)
+    x1 = np.minimum(x0 + 1, source_width - 1)
+    y_weight = (np.clip(y_positions, 0.0, source_height - 1.0) - y0).astype(np.float32)
+    x_weight = (np.clip(x_positions, 0.0, source_width - 1.0) - x0).astype(np.float32)
+
+    top = (
+        (1.0 - x_weight)[None, :, None] * frame[y0[:, None], x0[None, :]]
+        + x_weight[None, :, None] * frame[y0[:, None], x1[None, :]]
+    )
+    bottom = (
+        (1.0 - x_weight)[None, :, None] * frame[y1[:, None], x0[None, :]]
+        + x_weight[None, :, None] * frame[y1[:, None], x1[None, :]]
+    )
+    resized = (1.0 - y_weight)[:, None, None] * top + y_weight[:, None, None] * bottom
+    return np.clip(np.rint(resized), 0, 255).astype(np.uint8)
 
 
 def encode_frame_sequence(frame_directory: str | Path, path: str | Path, *, fps: int = 25) -> Path:
