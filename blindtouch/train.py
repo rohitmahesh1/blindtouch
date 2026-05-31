@@ -1,9 +1,9 @@
 """PPO and SAC training entry point for BlindTouch.
 
 This module keeps Stable-Baselines3 as an optional runtime dependency so the
-simulation, rendering, and tests remain usable before training packages are
-installed. Production learning is deliberately gated until the randomized
-oracle feasibility diagnostic meets the readiness target recorded in todo.txt.
+simulation, rendering, and tests remain usable without training packages.
+Training runs are gated by locked feasibility and validation checks before
+longer PPO or SAC updates are launched.
 """
 
 from __future__ import annotations
@@ -86,12 +86,12 @@ TOUCH_TEACHER_MODES = (
 )
 FEASIBILITY_GATE_MESSAGE = (
     "Only the robust_upright and upright stage-1 curricula are currently certified for training. "
-    "Use --allow-uncertified-environment only for deliberate pipeline dry runs "
+    "Use --allow-uncertified-environment only for controlled pipeline checks "
     "on all_poses or with_chassis."
 )
 WARM_START_GATE_MESSAGE = (
     "Warm-start teacher did not meet the procedural validation gate; lower the gate only for "
-    "deliberate debugging, or improve the teacher before behavior cloning."
+    "controlled analysis, or improve the teacher before behavior cloning."
 )
 WARM_START_POLICY_GATE_MESSAGE = (
     "Warm-start policy did not meet the post-BC validation gate; improve behavior cloning "
@@ -1191,7 +1191,7 @@ def _configure_sac_bc_anchor(
     observations: NDArray[np.float32],
     actions: NDArray[np.float32],
 ) -> None:
-    """Backward-compatible wrapper for tests and older scratch tooling."""
+    """Compatibility wrapper for the SAC behavior-cloning anchor path."""
 
     _configure_sac_warm_start_anchors(model, config, observations, actions)
 
@@ -1626,7 +1626,7 @@ def _batch_indices(
 
 
 def _history_safe_force_teacher_action(stacked_observation: Observation) -> Action:
-    """Return a non-oracle warm-start action from the policy's own history input."""
+    """Return a warm-start action from the policy's own history input."""
 
     frames = stacked_observation.reshape(-1, BASE_OBSERVATION_SIZE)
     latest = frames[-1]
@@ -1907,7 +1907,7 @@ def main() -> None:
     parser.add_argument(
         "--allow-uncertified-environment",
         action="store_true",
-        help="Acknowledge the failing oracle feasibility gate for an intentional dry run.",
+        help="Allow a curriculum before it has passed the configured feasibility gate.",
     )
     parser.add_argument(
         "--warm-start-transitions",
@@ -2012,7 +2012,7 @@ def main() -> None:
     parser.add_argument(
         "--learning-rate",
         type=float,
-        help="Override the algorithm learning rate for targeted tuning experiments.",
+        help="Override the algorithm learning rate.",
     )
     parser.add_argument(
         "--ppo-clip-range",
@@ -2027,7 +2027,7 @@ def main() -> None:
     parser.add_argument(
         "--sac-learning-starts",
         type=int,
-        help="Override SAC learning_starts for preservation experiments.",
+        help="Override SAC learning_starts.",
     )
     parser.add_argument(
         "--sac-ent-coef",

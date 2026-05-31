@@ -132,7 +132,7 @@ def test_curriculum_expands_poses_then_adds_compound_chassis_family() -> None:
             evaluation_suites=("validation_procedural", "validation_procedural"),
         )
     with pytest.raises(ValueError, match="Unsupported evaluation"):
-        TrainingConfig("ppo", evaluation_suites=("demo",))  # type: ignore[arg-type]
+        TrainingConfig("ppo", evaluation_suites=("unsupported",))  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="promotion_suite"):
         TrainingConfig(
             "ppo",
@@ -269,11 +269,11 @@ def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
         "rigid_side_gap_success": 258,
     }
     with pytest.raises(ValueError, match="Unsupported warm-start teacher"):
-        TrainingConfig("ppo", warm_start_teacher="oracle")  # type: ignore[arg-type]
+        TrainingConfig("ppo", warm_start_teacher="unsupported")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="Unsupported warm-start profile"):
-        TrainingConfig("ppo", warm_start_profile="oracle")  # type: ignore[arg-type]
+        TrainingConfig("ppo", warm_start_profile="unsupported")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="validation suite"):
-        TrainingConfig("ppo", warm_start_validation_suite="demo")  # type: ignore[arg-type]
+        TrainingConfig("ppo", warm_start_validation_suite="unsupported")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="validation_limit"):
         TrainingConfig("ppo", warm_start_validation_limit=0)
     with pytest.raises(ValueError, match="safe_success_rate"):
@@ -281,7 +281,7 @@ def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
     with pytest.raises(ValueError, match="warm_start_learning_rate"):
         TrainingConfig("ppo", warm_start_learning_rate=0.0)
     with pytest.raises(ValueError, match="policy gate suite"):
-        TrainingConfig("ppo", warm_start_policy_gate_suite="demo")  # type: ignore[arg-type]
+        TrainingConfig("ppo", warm_start_policy_gate_suite="unsupported")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="included in evaluation_suites"):
         TrainingConfig(
             "ppo",
