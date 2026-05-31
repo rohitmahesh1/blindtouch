@@ -187,8 +187,8 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         )
         for geom_id in self._mutable_object_geom_ids:
             # MuJoCo optimizes XML geoms at identity as body-frame geoms. These
-            # placeholders are repositioned at reset time, so keep their local
-            # transforms active.
+            # mutable object geoms are repositioned at reset time, so keep their
+            # local transforms active.
             self.model.geom_sameframe[geom_id] = int(mujoco.mjtSameFrame.mjSAMEFRAME_NONE)
         self._material_ids = {"object": self.model.material("object").id}
         self._pad_geom_ids = np.array(
@@ -430,7 +430,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         return observation, float(reward), terminated, truncated, info
 
     def render(self) -> NDArray[np.uint8] | None:
-        """Render the scene for demonstrations, never as a policy observation."""
+        """Render the scene without adding pixels to the policy observation."""
 
         if self.render_mode == "rgb_array":
             if self._renderer is None:

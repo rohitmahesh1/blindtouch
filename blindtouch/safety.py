@@ -75,7 +75,7 @@ class SafetyFilterResult:
 
 
 def fragile_smooth_0p32_config() -> TactileSafetyFilterConfig:
-    """Current best fragile safety wrapper from the scratch guard sweep."""
+    """Default safety operating point for fragile-object handling."""
 
     return TactileSafetyFilterConfig(
         name="fragile_smooth_0p32",

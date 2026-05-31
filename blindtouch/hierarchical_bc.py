@@ -1,7 +1,7 @@
 """Trajectory storage and hierarchical behavior cloning for BlindTouch.
 
 The trajectory store preserves skill labels and teacher metadata so offline
-demonstrations do not collapse into one anonymous action-regression soup.  The
+demonstrations remain separable across tactile action modes. The
 hierarchical policy still exposes the same ``predict`` method used by the rest
 of the training/evaluation code: observations in, actions out.
 """
