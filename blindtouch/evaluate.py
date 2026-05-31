@@ -669,8 +669,13 @@ def add_overlay(
         for row in range(3):
             for column in range(3):
                 strength = float(np.clip(taxels[finger, row, column], 0.0, 1.0))
+                display_strength = float(np.clip(np.power(strength * 3.0, 0.55), 0.0, 1.0))
                 color = np.array(
-                    [34 + 218 * strength, 73 + 122 * strength, 104 - 62 * strength],
+                    [
+                        28 + 227 * display_strength,
+                        64 + 158 * display_strength,
+                        96 - 24 * display_strength,
+                    ],
                     dtype=np.uint8,
                 )
                 top = panel_y + grid_top + row * cell_pitch
