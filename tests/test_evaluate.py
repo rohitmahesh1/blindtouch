@@ -109,7 +109,7 @@ def test_locked_suites_have_fixed_sizes_and_reproducible_metadata() -> None:
         "stress" in case.object.evaluation_tags
         for case in build_locked_suite("test_stress").cases
     )
-    assert RETIRED_SUITE_ALIASES["test_household"] == "dev_household_seen"
+    assert RETIRED_SUITE_ALIASES["test_household"] == "retired_household_seen"
     with pytest.raises(ValueError, match="retired"):
         build_locked_suite("test_household")
 
@@ -255,14 +255,14 @@ def test_feasibility_report_preserves_seeded_physics_and_grouped_failures(tmp_pa
     grouped = group_feasibility_failures(records)
     assert sum(group["count"] for group in grouped) == 3
     csv_path, jsonl_path, grouped_path = write_feasibility_report(
-        records, tmp_path / "oracle_gate"
+        records, tmp_path / "feasibility_gate"
     )
     assert csv_path.exists()
     assert jsonl_path.exists()
     assert json.loads(grouped_path.read_text(encoding="utf-8")) == grouped
 
 
-def test_feasibility_trajectory_search_records_declared_oracle_attempts() -> None:
+def test_feasibility_trajectory_search_records_declared_attempts() -> None:
     records = search_feasible_trajectories(
         seeds=range(1),
         env_config=EnvConfig(exploration_steps=0, max_episode_steps=2),

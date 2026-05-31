@@ -2,7 +2,7 @@
 
 Evaluation cases carry privileged object parameters because they define the
 benchmark and its report. Controllers receive only the normal environment
-observation unless they are explicitly instantiated as oracle diagnostics.
+observation unless they are explicitly instantiated for feasibility analysis.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from numpy.typing import NDArray
 from .controllers import (
     Controller,
     FixedGripController,
-    OracleDebugController,
+    PrivilegedFeasibilityController,
     ProbeThenLiftController,
     ThresholdGripController,
 )
@@ -50,7 +50,7 @@ SUITE_SEED_OFFSETS = {
     "test_stress": 40_000,
 }
 RETIRED_SUITE_ALIASES = {
-    "test_household": "dev_household_seen",
+    "test_household": "retired_household_seen",
     "validation_interp": "validation_procedural",
 }
 PROCEDURAL_SUITE_FAMILIES = tuple(TRAINING_FAMILIES)
@@ -192,8 +192,8 @@ def build_locked_suite(name: str, *, limit: int | None = None) -> EvaluationSuit
         if name in RETIRED_SUITE_ALIASES:
             replacement = RETIRED_SUITE_ALIASES[name]
             raise ValueError(
-                f"Suite {name!r} is retired on main; use {replacement!r} for historical "
-                "discussion or a current procedural suite for new experiments."
+                f"Suite {name!r} is retired; use {replacement!r} for historical "
+                "comparison or a current procedural suite for evaluation."
             )
         raise ValueError(f"Unknown evaluation suite: {name!r}")
     if limit is not None and limit < 1:
@@ -257,7 +257,7 @@ def run_feasibility_diagnostic(
     seeds: Iterable[int] = range(200),
     sampling_config: SamplingConfig | None = None,
     env_config: EnvConfig = BASELINE_ENV_CONFIG,
-    controller_factory: ControllerFactory = OracleDebugController,
+    controller_factory: ControllerFactory = PrivilegedFeasibilityController,
 ) -> list[dict[str, Any]]:
     """Run privileged fixed-seed certification while recording physical failure signals."""
 
@@ -313,7 +313,7 @@ def search_feasible_trajectories(
                         env,
                         int(seed),
                         episode_object,
-                        OracleDebugController(scripted_close_phases=plan),
+                        PrivilegedFeasibilityController(scripted_close_phases=plan),
                         strategy=strategy,
                         attempted_strategies=len(attempts) + 1,
                         env_config=env_config,
@@ -1083,7 +1083,7 @@ def main() -> None:
     parser.add_argument("--camera", choices=("overview", "closeup"), default="overview")
     parser.add_argument(
         "--controller",
-        choices=("fixed", "threshold", "probe", "oracle"),
+        choices=("fixed", "threshold", "probe", "feasibility"),
         default="probe",
     )
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N cases.")
@@ -1096,9 +1096,9 @@ def main() -> None:
         "fixed": FixedGripController,
         "threshold": ThresholdGripController,
         "probe": ProbeThenLiftController,
-        "oracle": OracleDebugController,
+        "feasibility": PrivilegedFeasibilityController,
     }
-    privileged_controller = args.controller == "oracle"
+    privileged_controller = args.controller == "feasibility"
     if args.feasibility:
         count = args.limit or 200
         if args.trajectory_search:
@@ -1106,7 +1106,7 @@ def main() -> None:
             prefix = args.output_dir / "feasibility_trajectory_search"
         else:
             records = run_feasibility_diagnostic(seeds=range(count))
-            prefix = args.output_dir / "feasibility_oracle"
+            prefix = args.output_dir / "feasibility_controller"
         csv_path, jsonl_path, grouped_path = write_feasibility_report(records, prefix)
         outcomes = Counter(record["outcome"] for record in records)
         print(

@@ -1,8 +1,8 @@
 """Auditable scripted controllers for BlindTouch baseline evaluation.
 
-Non-oracle controllers consume only the policy observation and their own
-command counter.  The oracle controller is intentionally privileged and exists
-only to detect task instances that are not safely liftable by the mechanics.
+Standard controllers consume only the policy observation and their own command
+counter. The feasibility controller is intentionally privileged and exists only
+to detect task instances that are not safely liftable by the mechanics.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ DEFAULT_TACTILE_FORCE_SCALE = 5.0
 
 
 class Controller(Protocol):
-    """Small controller contract shared by baselines and future evaluation."""
+    """Controller contract shared by baselines and evaluation."""
 
     def reset(self, observation: Observation, info: Mapping[str, Any]) -> None:
         """Begin a new episode."""
@@ -114,7 +114,7 @@ class ThresholdGripController:
 class SafeForceGripController:
     """Balance fingertip forces in a modest tactile band before lifting.
 
-    This is intentionally a non-oracle teacher: it only reads taxels and timing,
+    This controller only reads taxels and timing,
     not hidden mass, friction, safe-force limits, labels, or diagnostic pad force.
     """
 
@@ -274,7 +274,7 @@ class ProbeThenLiftController:
 
 
 @dataclass
-class OracleDebugController:
+class PrivilegedFeasibilityController:
     """Privileged feasibility controller; never report it as a baseline."""
 
     scripted_close_phases: tuple[tuple[float, int], ...] | None = None
@@ -348,7 +348,7 @@ class OracleDebugController:
 __all__ = [
     "Controller",
     "FixedGripController",
-    "OracleDebugController",
+    "PrivilegedFeasibilityController",
     "ProbeThenLiftController",
     "SafeForceGripController",
     "ThresholdGripController",
