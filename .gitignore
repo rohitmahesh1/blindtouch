@@ -1,6 +1,3 @@
-todo.txt
-todo-new.txt
-
 # Virtual environments and local configuration
 .venv/
 .env
@@ -17,7 +14,7 @@ __pycache__/
 coverage.xml
 htmlcov/
 
-# Packaging/build artifacts
+# Packaging outputs
 build/
 dist/
 *.egg-info/
@@ -26,7 +23,7 @@ dist/
 log.txt
 *.log
 
-# Generated BlindTouch artifacts
+# Generated BlindTouch outputs
 scratch/
 renders/
 reports/

@@ -3,7 +3,7 @@
      model:
     - vertical palm actuator and three radial closing actuators
     - collidable pad and nine built-in touch regions per finger
-    - rigid mystery-object placeholder for smoke tests
+    - mutable object body for procedural manipulation tasks
   -->
   <compiler angle="radian" autolimits="true"/>
   <option timestep="0.002" integrator="implicitfast" gravity="0 0 -9.81"
@@ -20,7 +20,6 @@
     <joint damping="0.8" armature="0.002"/>
     <geom margin="0.001"/>
 
-    <!-- make structural bodies visible -->
     <default class="structure">
       <geom contype="0" conaffinity="0" material="frame"/>
     </default>
@@ -61,7 +60,7 @@
     <material name="rail" rgba="0.42 0.48 0.55 1"/>
     <material name="pad" rgba="0.12 0.55 0.70 1"/>
     <material name="object" rgba="0.92 0.60 0.18 1"/>
-    <mesh name="demo_banana_mesh" file="objects/demo_banana.obj" smoothnormal="true"/>
+    <mesh name="banana_visual_mesh" file="objects/banana_visual.obj" smoothnormal="true"/>
   </asset>
 
   <worldbody>
@@ -156,7 +155,6 @@
       </body>
     </body>
 
-    <!-- note: env.py will later vary hidden properties -->
     <body name="object" pos="0 0 0.030">
       <freejoint name="object_free"/>
       <geom name="object_geom" class="object_contact" type="cylinder"
@@ -177,7 +175,7 @@
       <geom name="object_wheel_rr_geom" class="object_contact" type="sphere"
             size="0.001" mass="0" contype="0" conaffinity="0"
             rgba="0 0 0 0"/>
-      <geom name="object_banana_visual_geom" type="mesh" mesh="demo_banana_mesh"
+      <geom name="object_banana_visual_geom" type="mesh" mesh="banana_visual_mesh"
             mass="0" contype="0" conaffinity="0" rgba="0 0 0 0"/>
       <site name="object_center" type="sphere" size="0.0025"
             rgba="1 1 1 0.65" group="4"/>

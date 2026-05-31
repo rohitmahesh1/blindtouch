@@ -1,4 +1,4 @@
-# Smooth visual-only banana mesh for BlindTouch demo rendering.
+# Smooth visual-only banana mesh for BlindTouch rendering.
 # Units are meters; the policy still contacts the simple capsule proxy.
 v -0.006000 0.006600 -0.044000
 v -0.003950 0.006365 -0.045062
