@@ -1,6 +1,13 @@
 BlindTouch
 ==========
 
+Demo
+----
+
+[![BlindTouch demo](https://img.youtube.com/vi/nfyAUmTXU9E/hqdefault.jpg)](https://www.youtube.com/watch?v=nfyAUmTXU9E)
+
+[Watch the demo on YouTube](https://www.youtube.com/watch?v=nfyAUmTXU9E)
+
 BlindTouch is a simulation-first tactile manipulation project. It trains and
 evaluates a three-finger robotic claw that handles unfamiliar objects using
 touch and proprioception alone, without camera input or object labels.
@@ -11,11 +18,6 @@ safety filtering, locked evaluation suites, and polished household-object
 showcase rendering.
 
 ![BlindTouch model flow](assets/blindtouch_model_flow.svg)
-
-Demo Showcase
--------------
-
-Coming soon!
 
 What Was Built
 --------------
