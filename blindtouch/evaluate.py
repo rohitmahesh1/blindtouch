@@ -2,7 +2,7 @@
 
 Evaluation cases carry privileged object parameters because they define the
 benchmark and its report. Controllers receive only the normal environment
-observation unless they are explicitly instantiated as oracle diagnostics.
+observation unless they are explicitly instantiated for feasibility analysis.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from numpy.typing import NDArray
 from .controllers import (
     Controller,
     FixedGripController,
-    OracleDebugController,
+    PrivilegedFeasibilityController,
     ProbeThenLiftController,
     ThresholdGripController,
 )
@@ -31,25 +31,29 @@ from .env import BlindTouchEnv, EnvConfig
 from .objects import (
     EpisodeObject,
     SamplingConfig,
+    TRAINING_FAMILIES,
     episode_object_from_mapping,
-    get_demo_object,
     sample_training_object,
 )
 
 
 SUITE_SIZES = {
-    "validation_interp": 300,
+    "validation_procedural": 300,
+    "test_procedural_holdout": 300,
     "test_pose": 200,
-    "test_household": 160,
     "test_stress": 100,
 }
 SUITE_SEED_OFFSETS = {
-    "validation_interp": 10_000,
+    "validation_procedural": 10_000,
+    "test_procedural_holdout": 50_000,
     "test_pose": 20_000,
-    "test_household": 30_000,
     "test_stress": 40_000,
 }
-HOUSEHOLD_NAMES = ("orange", "toy_car", "soap_bar", "tomato")
+RETIRED_SUITE_ALIASES = {
+    "test_household": "retired_household_seen",
+    "validation_interp": "validation_procedural",
+}
+PROCEDURAL_SUITE_FAMILIES = tuple(TRAINING_FAMILIES)
 BASELINE_ENV_CONFIG = EnvConfig(exploration_steps=0, max_episode_steps=120)
 REPORT_FIELDS = (
     "controller",
@@ -171,12 +175,6 @@ class ReplayResult:
     video_path: Path | None
 
 
-def demo_case(name: str, pose: str | None = None, *, seed: int = 50_000) -> EvaluationCase:
-    """Create a deterministic named-object case for demonstration rendering."""
-
-    return EvaluationCase("demo", seed, get_demo_object(name, pose))
-
-
 def public_controller_info(info: Mapping[str, Any]) -> dict[str, Any]:
     """Expose only timing/outcome state to ordinary scripted or learned policies."""
 
@@ -191,14 +189,20 @@ def build_locked_suite(name: str, *, limit: int | None = None) -> EvaluationSuit
     """Build one evaluation suite from fixed seeds and auditable constructors."""
 
     if name not in SUITE_SIZES:
+        if name in RETIRED_SUITE_ALIASES:
+            replacement = RETIRED_SUITE_ALIASES[name]
+            raise ValueError(
+                f"Suite {name!r} is retired; use {replacement!r} for historical "
+                "comparison or a current procedural suite for evaluation."
+            )
         raise ValueError(f"Unknown evaluation suite: {name!r}")
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive when provided")
     count = SUITE_SIZES[name] if limit is None else min(limit, SUITE_SIZES[name])
     builder = {
-        "validation_interp": _validation_case,
+        "validation_procedural": _validation_case,
+        "test_procedural_holdout": _holdout_case,
         "test_pose": _pose_case,
-        "test_household": _household_case,
         "test_stress": _stress_case,
     }[name]
     return EvaluationSuite(name=name, cases=tuple(builder(index) for index in range(count)))
@@ -253,7 +257,7 @@ def run_feasibility_diagnostic(
     seeds: Iterable[int] = range(200),
     sampling_config: SamplingConfig | None = None,
     env_config: EnvConfig = BASELINE_ENV_CONFIG,
-    controller_factory: ControllerFactory = OracleDebugController,
+    controller_factory: ControllerFactory = PrivilegedFeasibilityController,
 ) -> list[dict[str, Any]]:
     """Run privileged fixed-seed certification while recording physical failure signals."""
 
@@ -309,7 +313,7 @@ def search_feasible_trajectories(
                         env,
                         int(seed),
                         episode_object,
-                        OracleDebugController(scripted_close_phases=plan),
+                        PrivilegedFeasibilityController(scripted_close_phases=plan),
                         strategy=strategy,
                         attempted_strategies=len(attempts) + 1,
                         env_config=env_config,
@@ -424,6 +428,67 @@ def group_feasibility_failures(records: Iterable[dict[str, Any]]) -> list[dict[s
         }
         for key, count in sorted(counts.items())
     ]
+
+
+def classify_failure_mode(record: Mapping[str, Any]) -> str:
+    """Map one evaluation row to an object-agnostic failure bucket."""
+
+    if bool(record.get("safe_success")):
+        return "success"
+    outcome = str(record.get("outcome") or "unknown")
+    if outcome in {"damage", "drop", "unstable"}:
+        return outcome
+    if int(record.get("slip_events", 0) or 0) > 0:
+        return "slip"
+    if outcome == "timeout":
+        max_contacts = int(record.get("max_contacts", 0) or 0)
+        final_lift_height = float(record.get("final_lift_height", 0.0) or 0.0)
+        if max_contacts < 2:
+            return "timeout_no_grip"
+        if final_lift_height < BASELINE_ENV_CONFIG.attempted_lift_height * 0.50:
+            return "timeout_no_lift"
+        if final_lift_height < BASELINE_ENV_CONFIG.lift_target_height:
+            return "timeout_weak_lift"
+        return "timeout_hold"
+    return outcome
+
+
+def summarize_evaluation_records(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize procedural evaluation trends without object-name tuning hooks."""
+
+    rows = list(records)
+    summary = _evaluation_subset_summary(rows)
+    summary["by_family"] = {
+        family: _evaluation_subset_summary(
+            [record for record in rows if str(record["object_family"]) == family]
+        )
+        for family in sorted({str(record["object_family"]) for record in rows})
+    }
+    return summary
+
+
+def _evaluation_subset_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    success_count = sum(bool(record["safe_success"]) for record in rows)
+    outcome_counts = Counter(str(record["outcome"]) for record in rows)
+    failure_counts = Counter(
+        classify_failure_mode(record) for record in rows if not bool(record["safe_success"])
+    )
+    return {
+        "episodes": len(rows),
+        "safe_successes": success_count,
+        "safe_success_rate": success_count / len(rows) if rows else 0.0,
+        "outcomes": dict(sorted(outcome_counts.items())),
+        "failure_modes": dict(sorted(failure_counts.items())),
+        "mean_peak_force": _mean_record_value(rows, "peak_force"),
+        "mean_slip_events": _mean_record_value(rows, "slip_events"),
+        "mean_final_lift_height": _mean_record_value(rows, "final_lift_height"),
+    }
+
+
+def _mean_record_value(rows: list[dict[str, Any]], field: str) -> float:
+    if not rows:
+        return 0.0
+    return float(np.mean([float(record[field]) for record in rows]))
 
 
 def write_feasibility_report(
@@ -604,8 +669,13 @@ def add_overlay(
         for row in range(3):
             for column in range(3):
                 strength = float(np.clip(taxels[finger, row, column], 0.0, 1.0))
+                display_strength = float(np.clip(np.power(strength * 3.0, 0.55), 0.0, 1.0))
                 color = np.array(
-                    [34 + 218 * strength, 73 + 122 * strength, 104 - 62 * strength],
+                    [
+                        28 + 227 * display_strength,
+                        64 + 158 * display_strength,
+                        96 - 24 * display_strength,
+                    ],
                     dtype=np.uint8,
                 )
                 top = panel_y + grid_top + row * cell_pitch
@@ -645,7 +715,7 @@ def _scene_with_claw_left(frame: Frame) -> Frame:
     scale = max(width / source_width, height / source_height)
     scene_width = max(1, int(source_width * scale))
     scene_height = max(1, int(source_height * scale))
-    scene = _resize_nearest(scene_source, scene_height, scene_width)
+    scene = _resize_bilinear(scene_source, scene_height, scene_width)
     left = max(0, (scene_width - width) // 2)
     top = max(0, (scene_height - height) // 2)
     return scene[top : top + height, left : left + width].copy()
@@ -706,17 +776,34 @@ def _blend_panel(
     image[max(y, bottom - 2) : bottom, x:right] = border
 
 
-def _resize_nearest(frame: Frame, height: int, width: int) -> Frame:
+def _resize_bilinear(frame: Frame, height: int, width: int) -> Frame:
     source_height, source_width, _ = frame.shape
-    y_indices = np.minimum(
-        (np.arange(height, dtype=np.float64) * source_height / height).astype(np.int64),
-        source_height - 1,
+    if height == source_height and width == source_width:
+        return frame.copy()
+
+    y_positions = (
+        (np.arange(height, dtype=np.float32) + 0.5) * source_height / height - 0.5
     )
-    x_indices = np.minimum(
-        (np.arange(width, dtype=np.float64) * source_width / width).astype(np.int64),
-        source_width - 1,
+    x_positions = (
+        (np.arange(width, dtype=np.float32) + 0.5) * source_width / width - 0.5
     )
-    return frame[y_indices[:, None], x_indices]
+    y0 = np.floor(np.clip(y_positions, 0.0, source_height - 1.0)).astype(np.int64)
+    x0 = np.floor(np.clip(x_positions, 0.0, source_width - 1.0)).astype(np.int64)
+    y1 = np.minimum(y0 + 1, source_height - 1)
+    x1 = np.minimum(x0 + 1, source_width - 1)
+    y_weight = (np.clip(y_positions, 0.0, source_height - 1.0) - y0).astype(np.float32)
+    x_weight = (np.clip(x_positions, 0.0, source_width - 1.0) - x0).astype(np.float32)
+
+    top = (
+        (1.0 - x_weight)[None, :, None] * frame[y0[:, None], x0[None, :]]
+        + x_weight[None, :, None] * frame[y0[:, None], x1[None, :]]
+    )
+    bottom = (
+        (1.0 - x_weight)[None, :, None] * frame[y1[:, None], x0[None, :]]
+        + x_weight[None, :, None] * frame[y1[:, None], x1[None, :]]
+    )
+    resized = (1.0 - y_weight)[:, None, None] * top + y_weight[:, None, None] * bottom
+    return np.clip(np.rint(resized), 0, 255).astype(np.uint8)
 
 
 def encode_frame_sequence(frame_directory: str | Path, path: str | Path, *, fps: int = 25) -> Path:
@@ -907,9 +994,25 @@ def write_jsonl_report(records: Iterable[dict[str, Any]], path: str | Path) -> P
 
 
 def _validation_case(index: int) -> EvaluationCase:
-    seed = SUITE_SEED_OFFSETS["validation_interp"] + index
-    episode_object = sample_training_object(np.random.default_rng(seed))
-    return EvaluationCase("validation_interp", seed, episode_object)
+    return _procedural_case("validation_procedural", index)
+
+
+def _holdout_case(index: int) -> EvaluationCase:
+    return _procedural_case("test_procedural_holdout", index)
+
+
+def _procedural_case(suite_name: str, index: int) -> EvaluationCase:
+    seed = SUITE_SEED_OFFSETS[suite_name] + index
+    family = PROCEDURAL_SUITE_FAMILIES[index % len(PROCEDURAL_SUITE_FAMILIES)]
+    episode_object = sample_training_object(
+        np.random.default_rng(seed),
+        SamplingConfig(training_families=(family,)),
+    )
+    episode_object = replace(
+        episode_object,
+        evaluation_tags=episode_object.evaluation_tags + (suite_name,),
+    )
+    return EvaluationCase(suite_name, seed, episode_object)
 
 
 def _pose_case(index: int) -> EvaluationCase:
@@ -920,26 +1023,6 @@ def _pose_case(index: int) -> EvaluationCase:
     )
     pose = "side_x" if family == "container" or index % 4 == 1 else "side_y"
     return EvaluationCase("test_pose", seed, _replace_pose(sampled, pose))
-
-
-def _household_case(index: int) -> EvaluationCase:
-    seed = SUITE_SEED_OFFSETS["test_household"] + index
-    name = HOUSEHOLD_NAMES[index // 40]
-    base = get_demo_object(name)
-    rng = np.random.default_rng(seed)
-    yaw = float(rng.uniform(-0.20, 0.20))
-    episode_object = replace(
-        base,
-        quaternion=_apply_yaw(base.quaternion, yaw),
-        mass=base.mass * float(rng.uniform(0.92, 1.08)),
-        friction=base.friction * float(rng.uniform(0.92, 1.08)),
-        safe_force=base.safe_force * float(rng.uniform(0.97, 1.03)),
-        x_offset=float(rng.uniform(-0.003, 0.003)),
-        y_offset=float(rng.uniform(-0.003, 0.003)),
-        yaw=yaw,
-        evaluation_tags=base.evaluation_tags + ("perturbed",),
-    )
-    return EvaluationCase("test_household", seed, episode_object)
 
 
 def _stress_case(index: int) -> EvaluationCase:
@@ -984,29 +1067,9 @@ def _replace_pose(episode_object: EpisodeObject, pose: str) -> EpisodeObject:
     )
 
 
-def _apply_yaw(
-    base: tuple[float, float, float, float], yaw: float
-) -> tuple[float, float, float, float]:
-    yaw_quaternion = np.array(
-        [np.cos(yaw / 2.0), 0.0, 0.0, np.sin(yaw / 2.0)], dtype=np.float64
-    )
-    w1, x1, y1, z1 = yaw_quaternion
-    w2, x2, y2, z2 = base
-    quaternion = np.array(
-        [
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        ]
-    )
-    quaternion /= np.linalg.norm(quaternion)
-    return tuple(float(value) for value in quaternion)  # type: ignore[return-value]
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run deterministic BlindTouch evaluation.")
-    parser.add_argument("--suite", choices=tuple(SUITE_SIZES), default="test_household")
+    parser.add_argument("--suite", choices=tuple(SUITE_SIZES), default="validation_procedural")
     parser.add_argument(
         "--feasibility",
         action="store_true",
@@ -1017,16 +1080,10 @@ def main() -> None:
         action="store_true",
         help="Use the declared finite privileged trajectory set with --feasibility.",
     )
-    parser.add_argument(
-        "--render-demo",
-        choices=HOUSEHOLD_NAMES,
-        help="Render one nominal household-object episode instead of a suite report.",
-    )
-    parser.add_argument("--pose", help="Named pose for --render-demo, when supported.")
     parser.add_argument("--camera", choices=("overview", "closeup"), default="overview")
     parser.add_argument(
         "--controller",
-        choices=("fixed", "threshold", "probe", "oracle"),
+        choices=("fixed", "threshold", "probe", "feasibility"),
         default="probe",
     )
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N cases.")
@@ -1039,9 +1096,9 @@ def main() -> None:
         "fixed": FixedGripController,
         "threshold": ThresholdGripController,
         "probe": ProbeThenLiftController,
-        "oracle": OracleDebugController,
+        "feasibility": PrivilegedFeasibilityController,
     }
-    privileged_controller = args.controller == "oracle"
+    privileged_controller = args.controller == "feasibility"
     if args.feasibility:
         count = args.limit or 200
         if args.trajectory_search:
@@ -1049,7 +1106,7 @@ def main() -> None:
             prefix = args.output_dir / "feasibility_trajectory_search"
         else:
             records = run_feasibility_diagnostic(seeds=range(count))
-            prefix = args.output_dir / "feasibility_oracle"
+            prefix = args.output_dir / "feasibility_controller"
         csv_path, jsonl_path, grouped_path = write_feasibility_report(records, prefix)
         outcomes = Counter(record["outcome"] for record in records)
         print(
@@ -1057,24 +1114,6 @@ def main() -> None:
             f"and {grouped_path}: {dict(outcomes)}"
         )
         return
-    if args.render_demo:
-        result = render_replay(
-            factories[args.controller],
-            demo_case(args.render_demo, args.pose),
-            controller_name=args.controller,
-            checkpoint=args.checkpoint,
-            output_dir=args.output_dir,
-            privileged_controller=privileged_controller,
-            camera_name=args.camera,
-            encode_video=not args.frames_only,
-        )
-        artifact = result.video_path or result.frame_directory
-        print(
-            f"Rendered {result.frame_count} frames to {artifact}: "
-            f"{result.record['outcome']} peak_force={result.record['peak_force']:.3f}"
-        )
-        return
-
     suite = build_locked_suite(args.suite, limit=args.limit)
     records = run_evaluation(
         factories[args.controller],
@@ -1098,15 +1137,15 @@ __all__ = [
     "BASELINE_ENV_CONFIG",
     "EvaluationCase",
     "EvaluationSuite",
-    "HOUSEHOLD_NAMES",
     "FEASIBILITY_REPORT_FIELDS",
     "FEASIBILITY_TRAJECTORY_PLANS",
     "REPORT_FIELDS",
     "ReplayResult",
+    "RETIRED_SUITE_ALIASES",
     "SUITE_SIZES",
     "add_overlay",
     "build_locked_suite",
-    "demo_case",
+    "classify_failure_mode",
     "encode_frame_sequence",
     "group_feasibility_failures",
     "public_controller_info",
@@ -1114,6 +1153,7 @@ __all__ = [
     "run_evaluation",
     "run_feasibility_diagnostic",
     "search_feasible_trajectories",
+    "summarize_evaluation_records",
     "write_csv_report",
     "write_feasibility_report",
     "write_jsonl_report",

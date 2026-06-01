@@ -34,6 +34,8 @@ def test_environment_satisfies_gymnasium_contract() -> None:
     assert "pose" in info["object_params"]
     assert info["reset_valid"]
     assert len(env.TAXEL_NAMES) == 27
+    assert set(info["reward_components"]) == set(env.REWARD_COMPONENT_NAMES)
+    assert sum(info["reward_components"].values()) == pytest.approx(0.0)
     env.close()
 
 
@@ -117,7 +119,15 @@ def test_supported_shapes_reset_and_training_randomization_is_feasible() -> None
 
 def test_chassis_enables_compound_contact_geometry_only_for_that_family() -> None:
     env = BlindTouchEnv()
-    _, car_info = env.reset(options={"demo_object": "toy_car"})
+    chassis_object = {
+        **FIXED_OBJECT,
+        "shape": "chassis",
+        "pose": "wheels_down",
+        "half_size_x": 0.0375,
+        "half_size_y": 0.0225,
+        "half_size_z": 0.0175,
+    }
+    _, car_info = env.reset(options={"object_params": chassis_object})
     assert car_info["object_params"]["shape"] == "chassis"
     assert all(env.model.geom_contype[geom_id] == 4 for geom_id in env._compound_geom_ids.values())
     close = np.array([0.0, 1.0, 1.0, 1.0], dtype=np.float32)
@@ -229,6 +239,22 @@ def test_reward_shaping_prefers_balanced_touch_to_inaction() -> None:
     assert touch_metrics["contact_count"] == 3
     assert touch_metrics["grip_score"] > 0.0
     assert touch_reward > no_touch_reward
+    env.close()
+
+
+def test_reward_components_sum_to_episode_reward() -> None:
+    env = BlindTouchEnv(config=EnvConfig(exploration_steps=0, max_episode_steps=1))
+    env.reset(options={"object_params": FIXED_OBJECT})
+
+    _, reward, terminated, truncated, info = env.step(np.zeros(4, dtype=np.float32))
+
+    assert not terminated
+    assert truncated
+    assert info["outcome"] == "timeout"
+    components = info["reward_components"]
+    assert set(components) == set(env.REWARD_COMPONENT_NAMES)
+    assert components["timeout"] < 0.0
+    assert sum(components.values()) == pytest.approx(reward)
     env.close()
 
 

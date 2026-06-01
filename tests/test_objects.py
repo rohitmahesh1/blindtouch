@@ -4,17 +4,35 @@ import pytest
 from blindtouch.objects import (
     TRAINING_FAMILIES,
     SamplingConfig,
+    TOUCH_SKILL_MODES,
     episode_object_from_mapping,
-    get_demo_object,
     sample_training_object,
 )
 
 
 def test_training_catalog_declares_auditable_families_and_stable_poses() -> None:
-    assert set(TRAINING_FAMILIES) == {"rounded", "container", "package", "chassis"}
+    assert set(TRAINING_FAMILIES) == {
+        "rounded",
+        "container",
+        "package",
+        "slippery",
+        "fragile",
+        "chassis",
+    }
     assert TRAINING_FAMILIES["rounded"].collision_kinds == ("ellipsoid",)
     assert TRAINING_FAMILIES["container"].collision_kinds == ("cylinder", "capsule")
     assert TRAINING_FAMILIES["package"].collision_kinds == ("box",)
+    assert set(TRAINING_FAMILIES["slippery"].collision_kinds) == {
+        "box",
+        "cylinder",
+        "capsule",
+        "ellipsoid",
+    }
+    assert set(TRAINING_FAMILIES["fragile"].collision_kinds) == {
+        "box",
+        "cylinder",
+        "ellipsoid",
+    }
     assert {pose.identifier for pose in TRAINING_FAMILIES["container"].stable_poses} == {
         "upright",
         "side_x",
@@ -24,6 +42,43 @@ def test_training_catalog_declares_auditable_families_and_stable_poses() -> None
     ) == pytest.approx(0.020)
     assert TRAINING_FAMILIES["chassis"].collision_kinds == ("chassis",)
     assert TRAINING_FAMILIES["chassis"].stable_poses[0].identifier == "wheels_down"
+    declared_modes = {
+        mode for family in TRAINING_FAMILIES.values() for mode in family.skill_modes
+    }
+    assert declared_modes == set(TOUCH_SKILL_MODES)
+
+
+def test_procedural_curriculum_includes_slippery_and_fragile_skills() -> None:
+    slippery_shapes = {
+        sample_training_object(
+            np.random.default_rng(seed),
+            SamplingConfig(training_families=("slippery",)),
+        ).shape
+        for seed in range(60)
+    }
+    fragile_shapes = {
+        sample_training_object(
+            np.random.default_rng(seed),
+            SamplingConfig(training_families=("fragile",)),
+        ).shape
+        for seed in range(60)
+    }
+
+    assert {"box", "cylinder", "capsule", "ellipsoid"} <= slippery_shapes
+    assert {"box", "cylinder", "ellipsoid"} <= fragile_shapes
+    for seed in range(20):
+        slippery = sample_training_object(
+            np.random.default_rng(seed),
+            SamplingConfig(training_families=("slippery",)),
+        )
+        fragile = sample_training_object(
+            np.random.default_rng(seed),
+            SamplingConfig(training_families=("fragile",)),
+        )
+        assert slippery.friction <= 0.36
+        assert "slippery_retention" in slippery.evaluation_tags
+        assert fragile.safe_force <= 0.90
+        assert "fragile_balance" in fragile.evaluation_tags
 
 
 def test_training_sampling_is_seeded_physical_and_includes_side_poses() -> None:
@@ -90,27 +145,6 @@ def test_sampling_config_can_target_safe_force_headroom() -> None:
                 safe_force_headroom_range=(0.0, 1.0),
             ),
         )
-
-
-def test_demo_objects_lock_household_specs_and_named_poses() -> None:
-    orange = get_demo_object("orange")
-    soap_edge = get_demo_object("soap_bar", "edge_resting")
-    tomato = get_demo_object("tomato")
-    car = get_demo_object("toy_car", "wheels_down")
-
-    assert orange.shape == "ellipsoid"
-    assert orange.mass == pytest.approx(0.120)
-    assert orange.friction == pytest.approx(0.69)
-    assert orange.safe_force == pytest.approx(0.92)
-    assert soap_edge.shape == "box"
-    assert soap_edge.pose == "edge_resting"
-    assert tomato.shape == "ellipsoid"
-    assert tomato.friction == pytest.approx(0.80)
-    assert tomato.safe_force == pytest.approx(0.55)
-    assert car.shape == "chassis"
-    assert "compound_collision" in car.evaluation_tags
-    with pytest.raises(ValueError):
-        get_demo_object("toy_car", "side_x")
 
 
 def test_custom_pose_computes_resting_axis_and_orientation() -> None:

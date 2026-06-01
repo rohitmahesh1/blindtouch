@@ -1,8 +1,12 @@
+import json
+import random
+
 import numpy as np
 import pytest
 
 from blindtouch.env import EnvConfig
-from blindtouch.evaluate import EvaluationSuite, ReplayResult, demo_case
+from blindtouch.evaluate import EvaluationCase, EvaluationSuite
+from blindtouch.objects import episode_object_from_mapping
 import blindtouch.train as train_module
 from blindtouch.train import (
     FEASIBILITY_GATE_MESSAGE,
@@ -12,7 +16,6 @@ from blindtouch.train import (
     curriculum_sampling_config,
     evaluate_policy,
     make_training_env,
-    render_learned_policy_replay,
     require_feasibility_acknowledgement,
 )
 
@@ -44,6 +47,30 @@ def test_training_contract_uses_stacked_touch_observations_for_both_algorithms()
     assert sac["buffer_size"] == 1_000_000
     assert sac["learning_starts"] == 10_000
     assert sac["ent_coef"] == "auto"
+    conservative = algorithm_hyperparameters(
+        "ppo",
+        TrainingConfig(
+            "ppo",
+            learning_rate=5e-5,
+            ppo_clip_range=0.05,
+            ppo_target_kl=0.02,
+        ),
+    )
+    assert conservative["learning_rate"] == pytest.approx(5e-5)
+    assert conservative["clip_range"] == pytest.approx(0.05)
+    assert conservative["target_kl"] == pytest.approx(0.02)
+    delayed_sac = algorithm_hyperparameters(
+        "sac",
+        TrainingConfig(
+            "sac",
+            learning_rate=5e-5,
+            sac_learning_starts=20_000,
+            sac_ent_coef=0.01,
+        ),
+    )
+    assert delayed_sac["learning_rate"] == pytest.approx(5e-5)
+    assert delayed_sac["learning_starts"] == 20_000
+    assert delayed_sac["ent_coef"] == pytest.approx(0.01)
     env.close()
 
 
@@ -73,6 +100,13 @@ def test_curriculum_expands_poses_then_adds_compound_chassis_family() -> None:
     assert any(metadata["family"] == "chassis" for metadata in family_metadata)
     with_chassis.close()
     stage_one = curriculum_sampling_config("upright")
+    assert stage_one.training_families == (
+        "rounded",
+        "container",
+        "package",
+        "slippery",
+        "fragile",
+    )
     assert stage_one.allowed_poses == ("upright",)
     assert stage_one.offset_range == (-0.002, 0.002)
     assert stage_one.safe_force_margin == pytest.approx(3.0)
@@ -82,9 +116,29 @@ def test_curriculum_expands_poses_then_adds_compound_chassis_family() -> None:
     assert robust_stage.mass_range == (0.030, 0.110)
     assert robust_stage.safe_force_margin == pytest.approx(4.0)
     fragile_stage = curriculum_sampling_config("fragile_upright")
-    assert fragile_stage.training_families == ("rounded", "container", "package")
+    assert fragile_stage.training_families == ("fragile", "rounded", "container", "package")
     assert fragile_stage.allowed_poses == ("upright",)
     assert fragile_stage.safe_force_headroom_range == (2.60, 3.80)
+    assert TrainingConfig("ppo").evaluation_suites == (
+        "validation_procedural",
+        "test_procedural_holdout",
+    )
+    assert TrainingConfig("ppo").promotion_suite == "test_procedural_holdout"
+    with pytest.raises(ValueError, match="evaluation_suites"):
+        TrainingConfig("ppo", evaluation_suites=())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="duplicates"):
+        TrainingConfig(
+            "ppo",
+            evaluation_suites=("validation_procedural", "validation_procedural"),
+        )
+    with pytest.raises(ValueError, match="Unsupported evaluation"):
+        TrainingConfig("ppo", evaluation_suites=("unsupported",))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="promotion_suite"):
+        TrainingConfig(
+            "ppo",
+            evaluation_suites=("validation_procedural",),
+            promotion_suite="test_procedural_holdout",
+        )
 
 
 def test_stacked_policy_controller_matches_training_history_layout() -> None:
@@ -131,6 +185,14 @@ def test_sac_bc_anchor_requires_warm_start_demonstrations() -> None:
             sac_bc_anchor_weight=1.0,
             sac_bc_anchor_batch_size=0,
         )
+    with pytest.raises(ValueError, match="requires warm_start_transitions"):
+        TrainingConfig("sac", sac_policy_anchor_weight=1.0)
+    with pytest.raises(ValueError, match="cannot be negative"):
+        TrainingConfig(
+            "sac",
+            warm_start_transitions=1,
+            sac_policy_anchor_weight=-1.0,
+        )
 
 
 def test_zero_step_training_is_reserved_for_warm_start_gates() -> None:
@@ -143,10 +205,34 @@ def test_zero_step_training_is_reserved_for_warm_start_gates() -> None:
 
 
 def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
-    assert TrainingConfig("ppo").warm_start_teacher == "safe_force"
+    assert TrainingConfig("ppo").warm_start_teacher == "composed_touch"
+    assert TrainingConfig("ppo").warm_start_learning_rate is None
+    assert train_module._warm_start_learning_rate(
+        TrainingConfig("ppo", learning_rate=2e-5)
+    ) == pytest.approx(3e-4)
+    assert train_module._warm_start_learning_rate(
+        TrainingConfig("sac", learning_rate=5e-5)
+    ) == pytest.approx(1e-4)
+    assert train_module._warm_start_learning_rate(
+        TrainingConfig("sac", warm_start_learning_rate=7e-5)
+    ) == pytest.approx(7e-5)
+    assert train_module.TOUCH_TEACHER_MODES == (
+        "round_retention",
+        "rigid_asymmetric",
+        "slippery_retention",
+        "fragile_balance",
+    )
     assert TrainingConfig("ppo", warm_start_teacher="composed_touch").warm_start_teacher == (
         "composed_touch"
     )
+    assert TrainingConfig("ppo").warm_start_validation_suite == "validation_procedural"
+    assert TrainingConfig("ppo").warm_start_validation_limit == 24
+    assert TrainingConfig("ppo").warm_start_min_safe_success_rate == pytest.approx(0.10)
+    assert TrainingConfig("ppo").warm_start_policy_gate_suite == "validation_procedural"
+    assert TrainingConfig("ppo").warm_start_policy_min_safe_success_rate == pytest.approx(0.10)
+    assert TrainingConfig("sac").sac_policy_anchor_weight == pytest.approx(0.0)
+    assert TrainingConfig("ppo").rl_regression_tolerance == pytest.approx(0.0)
+    assert TrainingConfig("ppo").stop_on_rl_regression is False
     assert train_module._warm_start_curriculum_stages(TrainingConfig("ppo")) == ("upright",)
     assert train_module._warm_start_curriculum_stages(
         TrainingConfig("ppo", warm_start_profile="fragile_mix")
@@ -158,10 +244,300 @@ def test_warm_start_teacher_can_use_composed_touch_prior() -> None:
             warm_start_profile="fragile_mix",
         )
     ) == ("fragile_upright",)
+    stratified_config = TrainingConfig("ppo", warm_start_profile="stratified_quality")
+    assert train_module._warm_start_curriculum_stages(stratified_config) == ("upright",)
+    buckets = train_module._stratified_quality_demo_buckets(stratified_config)
+    assert [bucket.name for bucket in buckets] == [
+        "stage_core",
+        "fragile_low_margin_success",
+        "rounded_retention_success",
+        "slippery_gap_success",
+        "rigid_side_gap_success",
+    ]
+    assert buckets[0].accept_outcomes is None
+    assert buckets[0].reject_branches == ("fragile_balance",)
+    assert buckets[0].teacher == "composed_touch"
+    assert buckets[1].teacher == "privileged_fragile"
+    assert all(bucket.accept_outcomes == ("success",) for bucket in buckets[1:])
+    assert [bucket.min_accepted_episodes for bucket in buckets[1:]] == [8, 8, 6, 6]
+    assert sum(bucket.weight for bucket in buckets) == pytest.approx(1.0)
+    assert train_module._transition_quotas(8624, buckets) == {
+        "stage_core": 7247,
+        "fragile_low_margin_success": 517,
+        "rounded_retention_success": 344,
+        "slippery_gap_success": 258,
+        "rigid_side_gap_success": 258,
+    }
     with pytest.raises(ValueError, match="Unsupported warm-start teacher"):
-        TrainingConfig("ppo", warm_start_teacher="oracle")  # type: ignore[arg-type]
+        TrainingConfig("ppo", warm_start_teacher="unsupported")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="Unsupported warm-start profile"):
-        TrainingConfig("ppo", warm_start_profile="oracle")  # type: ignore[arg-type]
+        TrainingConfig("ppo", warm_start_profile="unsupported")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="validation suite"):
+        TrainingConfig("ppo", warm_start_validation_suite="unsupported")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="validation_limit"):
+        TrainingConfig("ppo", warm_start_validation_limit=0)
+    with pytest.raises(ValueError, match="safe_success_rate"):
+        TrainingConfig("ppo", warm_start_min_safe_success_rate=1.1)
+    with pytest.raises(ValueError, match="warm_start_learning_rate"):
+        TrainingConfig("ppo", warm_start_learning_rate=0.0)
+    with pytest.raises(ValueError, match="policy gate suite"):
+        TrainingConfig("ppo", warm_start_policy_gate_suite="unsupported")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="included in evaluation_suites"):
+        TrainingConfig(
+            "ppo",
+            evaluation_suites=("test_procedural_holdout",),
+            warm_start_policy_gate_suite="validation_procedural",
+        )
+    with pytest.raises(ValueError, match="policy_min_safe_success_rate"):
+        TrainingConfig("ppo", warm_start_policy_min_safe_success_rate=1.1)
+    with pytest.raises(ValueError, match="rl_regression_tolerance"):
+        TrainingConfig("ppo", rl_regression_tolerance=-0.1)
+    with pytest.raises(ValueError, match="learning_rate"):
+        TrainingConfig("ppo", learning_rate=0.0)
+    with pytest.raises(ValueError, match="ppo_clip_range"):
+        TrainingConfig("ppo", ppo_clip_range=0.0)
+    with pytest.raises(ValueError, match="ppo_target_kl"):
+        TrainingConfig("ppo", ppo_target_kl=0.0)
+    with pytest.raises(ValueError, match="sac_learning_starts"):
+        TrainingConfig("sac", sac_learning_starts=-1)
+    with pytest.raises(ValueError, match="sac_ent_coef"):
+        TrainingConfig("sac", sac_ent_coef=0.0)
+
+
+def test_warm_start_teacher_validation_gate_uses_procedural_summary(monkeypatch) -> None:
+    def fake_run_evaluation(controller_factory, suite, **kwargs):
+        assert suite.name == "validation_procedural"
+        assert len(suite.cases) == 2
+        assert kwargs["controller_name"] == "safe_force_teacher"
+        controller = controller_factory()
+        observation = np.zeros(45, dtype=np.float32)
+        controller.reset(observation, {"phase": "explore", "step": 0, "outcome": None})
+        action = controller.act(observation, {"phase": "explore", "step": 0, "outcome": None})
+        assert action.shape == (4,)
+        return [
+            {
+                "object_family": "rounded",
+                "outcome": "success",
+                "safe_success": True,
+                "peak_force": 0.30,
+                "slip_events": 0,
+                "final_lift_height": 0.050,
+                "max_contacts": 3,
+            },
+            {
+                "object_family": "fragile",
+                "outcome": "damage",
+                "safe_success": False,
+                "peak_force": 0.90,
+                "slip_events": 0,
+                "final_lift_height": 0.020,
+                "max_contacts": 3,
+            },
+        ]
+
+    monkeypatch.setattr(train_module, "run_evaluation", fake_run_evaluation)
+    config = TrainingConfig(
+        "ppo",
+        warm_start_teacher="safe_force",
+        warm_start_validation_limit=2,
+        warm_start_min_safe_success_rate=0.50,
+    )
+
+    summary = train_module.validate_warm_start_teacher(config)
+
+    assert summary["safe_success_rate"] == pytest.approx(0.50)
+    assert summary["failure_modes"] == {"damage": 1}
+    with pytest.raises(RuntimeError, match="procedural validation gate"):
+        train_module.validate_warm_start_teacher(
+            TrainingConfig(
+                "ppo",
+                warm_start_teacher="safe_force",
+                warm_start_validation_limit=2,
+                warm_start_min_safe_success_rate=0.75,
+            )
+        )
+
+
+def test_training_resets_rngs_before_building_environment(monkeypatch, tmp_path) -> None:
+    calls: list[int] = []
+
+    def fake_seed(seed: int) -> None:
+        calls.append(seed)
+
+    def fake_make_training_env(**kwargs):
+        del kwargs
+        assert calls == [17]
+        raise RuntimeError("stop after seed")
+
+    monkeypatch.setattr(train_module, "_seed_training_rngs", fake_seed)
+    monkeypatch.setattr(train_module, "make_training_env", fake_make_training_env)
+
+    with pytest.raises(RuntimeError, match="stop after seed"):
+        train_module.train(
+            TrainingConfig(
+                "ppo",
+                seed=17,
+                output_root=tmp_path / "runs",
+                checkpoint_root=tmp_path / "checkpoints",
+                tensorboard_root=tmp_path / "tensorboard",
+            )
+        )
+
+
+def test_training_rng_seed_is_reproducible() -> None:
+    train_module._seed_training_rngs(23)
+    python_value = random.random()
+    numpy_value = float(np.random.random())
+
+    train_module._seed_training_rngs(23)
+
+    assert random.random() == pytest.approx(python_value)
+    assert float(np.random.random()) == pytest.approx(numpy_value)
+
+
+def test_torch_state_snapshot_detaches_and_clones_tensors() -> None:
+    torch = pytest.importorskip("torch")
+    layer = torch.nn.Linear(2, 1)
+
+    snapshot = train_module._snapshot_torch_state_dict(layer)
+    original_weight = snapshot["weight"].clone()
+    with torch.no_grad():
+        layer.weight.add_(1.0)
+
+    assert snapshot["weight"].requires_grad is False
+    assert snapshot["weight"] is not layer.state_dict()["weight"]
+    torch.testing.assert_close(snapshot["weight"], original_weight)
+
+
+def test_warm_start_learning_rate_context_restores_optimizer() -> None:
+    class DummyOptimizer:
+        def __init__(self) -> None:
+            self.param_groups = [{"lr": 1e-5}, {"lr": 2e-5}]
+
+    optimizer = DummyOptimizer()
+    with train_module._temporary_optimizer_learning_rate(optimizer, 3e-4):
+        assert [group["lr"] for group in optimizer.param_groups] == [3e-4, 3e-4]
+
+    assert [group["lr"] for group in optimizer.param_groups] == [1e-5, 2e-5]
+
+
+def test_warm_start_policy_gate_uses_post_bc_checkpoint_summary() -> None:
+    config = TrainingConfig(
+        "ppo",
+        warm_start_policy_min_safe_success_rate=0.50,
+    )
+    summaries = {
+        "validation_procedural": {
+            "safe_success_rate": 0.50,
+            "failure_modes": {"damage": 1},
+        }
+    }
+
+    summary = train_module.validate_warm_start_policy(summaries, config)
+
+    assert summary["safe_success_rate"] == pytest.approx(0.50)
+    with pytest.raises(RuntimeError, match="post-BC validation gate"):
+        train_module.validate_warm_start_policy(
+            {
+                "validation_procedural": {
+                    "safe_success_rate": 0.25,
+                    "failure_modes": {"drop": 3},
+                }
+            },
+            config,
+        )
+
+
+def test_checkpoint_preservation_report_compares_against_post_bc_score(tmp_path) -> None:
+    config = TrainingConfig("sac", rl_regression_tolerance=0.125)
+
+    preserved = train_module._checkpoint_preservation_record(
+        config,
+        baseline_label="step_0_warm_start",
+        baseline_score=(0.50, -0.80),
+        checkpoint_label="step_10000",
+        checkpoint_score=(0.375, -0.70),
+    )
+    regressed = train_module._checkpoint_preservation_record(
+        config,
+        baseline_label="step_0_warm_start",
+        baseline_score=(0.50, -0.80),
+        checkpoint_label="step_20000",
+        checkpoint_score=(0.25, -0.40),
+    )
+
+    assert preserved["passed"] is True
+    assert preserved["safe_success_delta"] == pytest.approx(-0.125)
+    assert preserved["required_safe_success_rate"] == pytest.approx(0.375)
+    assert preserved["mean_peak_force_delta"] == pytest.approx(-0.10)
+    assert regressed["passed"] is False
+    report = tmp_path / "rl_preservation.jsonl"
+    train_module._append_preservation_record(report, preserved)
+    train_module._append_preservation_record(report, regressed)
+    lines = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
+    assert [line["checkpoint"] for line in lines] == ["step_10000", "step_20000"]
+    assert "regressed" in train_module._preservation_status_message("sac", regressed)
+
+
+def test_checkpoint_evaluation_uses_all_suites_and_promotes_holdout(
+    monkeypatch, tmp_path
+) -> None:
+    calls: list[str] = []
+
+    def fake_evaluate_policy(
+        model,
+        suite,
+        *,
+        algorithm,
+        checkpoint,
+        history_length,
+        output_prefix,
+        env_config,
+    ):
+        del model, checkpoint, history_length, env_config
+        calls.append(suite.name)
+        assert algorithm == "ppo"
+        assert len(suite.cases) == 1
+        safe_success = suite.name == "test_procedural_holdout"
+        return [
+            {
+                "object_family": "rounded",
+                "outcome": "success" if safe_success else "timeout",
+                "safe_success": safe_success,
+                "peak_force": 0.25 if safe_success else 0.40,
+                "slip_events": 0,
+                "final_lift_height": 0.050 if safe_success else 0.0,
+                "max_contacts": 3 if safe_success else 0,
+            }
+        ]
+
+    monkeypatch.setattr(train_module, "evaluate_policy", fake_evaluate_policy)
+    config = TrainingConfig("ppo", evaluation_limit=1)
+
+    evaluation = train_module.evaluate_checkpoint(
+        RecordingPolicy(),
+        config,
+        checkpoint=tmp_path / "checkpoint.zip",
+        report_directory=tmp_path,
+        step_label="step_1",
+    )
+
+    assert calls == ["validation_procedural", "test_procedural_holdout"]
+    assert set(evaluation.records_by_suite) == set(config.evaluation_suites)
+    assert evaluation.report_paths["validation_procedural"] == (
+        tmp_path / "validation_procedural_step_1.csv"
+    )
+    assert evaluation.report_paths["test_procedural_holdout"] == (
+        tmp_path / "test_procedural_holdout_step_1.csv"
+    )
+    summary = json.loads(evaluation.summary_path.read_text(encoding="utf-8"))
+    assert evaluation.summaries == summary
+    assert summary["validation_procedural"]["failure_modes"] == {"timeout_no_grip": 1}
+    assert summary["test_procedural_holdout"]["safe_success_rate"] == pytest.approx(1.0)
+    assert train_module._promotion_score(evaluation.records_by_suite, config) == (
+        1.0,
+        -0.25,
+    )
 
 
 def test_sac_bc_anchor_configuration_attaches_demonstrations() -> None:
@@ -200,6 +576,29 @@ def test_sac_bc_anchor_configuration_attaches_demonstrations() -> None:
     assert call["seed"] == 41007
 
 
+def test_sac_policy_anchor_configuration_snapshots_post_bc_actor() -> None:
+    class DummyAnchoredSac:
+        def __init__(self) -> None:
+            self.calls: list[float] = []
+
+        def set_policy_anchor(self, *, weight: float) -> None:
+            self.calls.append(weight)
+
+    model = DummyAnchoredSac()
+    observations = np.zeros((3, 360), dtype=np.float32)
+    actions = np.zeros((3, 4), dtype=np.float32)
+    config = TrainingConfig(
+        "sac",
+        warm_start_transitions=3,
+        sac_policy_anchor_weight=0.75,
+    )
+
+    train_module._configure_sac_warm_start_anchors(model, config, observations, actions)
+
+    assert len(model.calls) == 1
+    assert model.calls[0] == pytest.approx(0.75)
+
+
 def test_history_safe_force_teacher_uses_only_policy_observation_history() -> None:
     frames = np.zeros((8, 45), dtype=np.float32)
     close_action = train_module._history_safe_force_teacher_action(frames.reshape(-1))
@@ -226,7 +625,7 @@ def test_composed_touch_teacher_starts_from_policy_observation_history() -> None
     stacked = np.zeros((8, 45), dtype=np.float32).reshape(-1)
     first_action = teacher.act(stacked)
     np.testing.assert_array_equal(
-        first_action, np.array([0.0, 0.26, 0.26, 0.26], dtype=np.float32)
+        first_action, np.array([0.0, 0.20, 0.20, 0.20], dtype=np.float32)
     )
 
     contacted = np.zeros((8, 45), dtype=np.float32)
@@ -236,18 +635,38 @@ def test_composed_touch_teacher_starts_from_policy_observation_history() -> None
     for _ in range(3):
         action = teacher.act(contacted.reshape(-1))
     assert action[0] >= 0.0
-    assert teacher.selected_branch in {"orange", "toy_car", "soap_bar", "tomato"}
+    assert teacher.selected_branch in {
+        "round_retention",
+        "rigid_asymmetric",
+        "slippery_retention",
+        "fragile_balance",
+    }
 
 
 def test_learned_policy_evaluation_uses_360_values_and_writes_reports(tmp_path) -> None:
     policy = RecordingPolicy()
-    suite = EvaluationSuite("demo", (demo_case("orange"),))
+    episode_object = episode_object_from_mapping(
+        {
+            "shape": "cylinder",
+            "half_size_x": 0.024,
+            "half_size_y": 0.024,
+            "half_size_z": 0.030,
+            "mass": 0.10,
+            "friction": 1.0,
+            "safe_force": 1.0,
+            "x_offset": 0.0,
+            "y_offset": 0.0,
+            "yaw": 0.0,
+            "name": "reference_object",
+        }
+    )
+    suite = EvaluationSuite("reference", (EvaluationCase("reference", 50_000, episode_object),))
     records = evaluate_policy(
         policy,
         suite,
         algorithm="ppo",
         checkpoint="dry.zip",
-        output_prefix=tmp_path / "ppo_demo",
+        output_prefix=tmp_path / "ppo_reference",
         env_config=EnvConfig(exploration_steps=0, max_episode_steps=2),
     )
 
@@ -256,50 +675,5 @@ def test_learned_policy_evaluation_uses_360_values_and_writes_reports(tmp_path) 
     assert records[0]["outcome"] == "timeout"
     assert policy.observations
     assert all(observation.shape == (360,) for observation in policy.observations)
-    assert (tmp_path / "ppo_demo.csv").exists()
-    assert (tmp_path / "ppo_demo.jsonl").exists()
-
-
-def test_learned_policy_replay_uses_loaded_policy_history_and_writes_frames(
-    tmp_path, monkeypatch
-) -> None:
-    policy = RecordingPolicy()
-
-    def fake_render_replay(controller_factory, case, **kwargs):
-        controller = controller_factory()
-        observation = np.arange(45, dtype=np.float32) / 100.0
-        controller.reset(observation, {})
-        action = controller.act(observation, {})
-        np.testing.assert_array_equal(action, np.zeros(4, dtype=np.float32))
-        assert case.object.name == "orange"
-        assert kwargs["controller_name"] == "ppo"
-        assert kwargs["checkpoint"] == "dry.zip"
-        assert kwargs["output_dir"] == tmp_path
-        return ReplayResult(
-            {"controller": "ppo", "checkpoint": "dry.zip", "object_name": "orange"},
-            3,
-            tmp_path / "orange_ppo_overview_frames",
-            None,
-        )
-
-    monkeypatch.setattr(train_module, "render_replay", fake_render_replay)
-    result = render_learned_policy_replay(
-        policy,
-        algorithm="ppo",
-        checkpoint="dry.zip",
-        object_name="orange",
-        output_dir=tmp_path,
-        env_config=EnvConfig(exploration_steps=0, max_episode_steps=2),
-        width=160,
-        height=120,
-        encode_video=False,
-    )
-
-    assert result.record["controller"] == "ppo"
-    assert result.record["checkpoint"] == "dry.zip"
-    assert result.record["object_name"] == "orange"
-    assert result.frame_count > 0
-    assert result.video_path is None
-    assert result.frame_directory == tmp_path / "orange_ppo_overview_frames"
-    assert policy.observations
-    assert all(observation.shape == (360,) for observation in policy.observations)
+    assert (tmp_path / "ppo_reference.csv").exists()
+    assert (tmp_path / "ppo_reference.jsonl").exists()

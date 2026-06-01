@@ -3,21 +3,24 @@ import json
 from typing import Any, Mapping
 
 import numpy as np
+import pytest
 
 from blindtouch.controllers import FixedGripController
 from blindtouch.env import BlindTouchEnv, EnvConfig, ObservationHistory
 from blindtouch.evaluate import (
     FEASIBILITY_REPORT_FIELDS,
     REPORT_FIELDS,
+    RETIRED_SUITE_ALIASES,
     SUITE_SIZES,
     add_overlay,
     build_locked_suite,
-    demo_case,
+    classify_failure_mode,
     group_feasibility_failures,
     public_controller_info,
     run_feasibility_diagnostic,
     run_evaluation,
     search_feasible_trajectories,
+    summarize_evaluation_records,
     write_csv_report,
     write_feasibility_report,
     write_jsonl_report,
@@ -78,27 +81,41 @@ def test_locked_suites_have_fixed_sizes_and_reproducible_metadata() -> None:
         assert len(first.cases) == count
         assert first == second
 
+    validation_cases = build_locked_suite("validation_procedural").cases
+    holdout_cases = build_locked_suite("test_procedural_holdout").cases
+    assert {case.object.family for case in validation_cases} == {
+        "rounded",
+        "container",
+        "package",
+        "slippery",
+        "fragile",
+        "chassis",
+    }
+    assert {case.object.family for case in holdout_cases} == {
+        "rounded",
+        "container",
+        "package",
+        "slippery",
+        "fragile",
+        "chassis",
+    }
+    assert validation_cases[0].seed != holdout_cases[0].seed
     pose_cases = build_locked_suite("test_pose").cases
     assert all(
         case.object.pose in {"side_x", "side_y"} and case.object.family in {"container", "package"}
         for case in pose_cases
     )
-    household_cases = build_locked_suite("test_household").cases
-    assert {case.object.name for case in household_cases} == {
-        "orange",
-        "toy_car",
-        "soap_bar",
-        "tomato",
-    }
-    assert all("perturbed" in case.object.evaluation_tags for case in household_cases)
     assert all(
         "stress" in case.object.evaluation_tags
         for case in build_locked_suite("test_stress").cases
     )
+    assert RETIRED_SUITE_ALIASES["test_household"] == "retired_household_seen"
+    with pytest.raises(ValueError, match="retired"):
+        build_locked_suite("test_household")
 
 
 def test_scripted_evaluation_reports_are_repeatable_and_complete(tmp_path) -> None:
-    suite = build_locked_suite("test_household", limit=4)
+    suite = build_locked_suite("test_pose", limit=4)
     first = run_evaluation(FixedGripController, suite, controller_name="fixed")
     second = run_evaluation(FixedGripController, suite, controller_name="fixed")
     assert first == second
@@ -114,13 +131,65 @@ def test_scripted_evaluation_reports_are_repeatable_and_complete(tmp_path) -> No
         rows = list(csv.DictReader(report))
     assert tuple(rows[0]) == REPORT_FIELDS
     assert len(rows) == 4
-    assert all(row["suite"] == "test_household" for row in rows)
+    assert all(row["suite"] == "test_pose" for row in rows)
     assert all("object_params" not in row for row in rows)
 
     json_rows = [
         json.loads(line) for line in first_jsonl.read_text(encoding="utf-8").splitlines()
     ]
     assert json_rows == first
+
+
+def test_evaluation_summary_groups_object_agnostic_failure_modes() -> None:
+    records = [
+        {
+            "object_family": "rounded",
+            "outcome": "success",
+            "safe_success": True,
+            "peak_force": 0.40,
+            "slip_events": 0,
+            "final_lift_height": 0.050,
+            "max_contacts": 3,
+        },
+        {
+            "object_family": "rounded",
+            "outcome": "timeout",
+            "safe_success": False,
+            "peak_force": 0.10,
+            "slip_events": 0,
+            "final_lift_height": 0.0,
+            "max_contacts": 0,
+        },
+        {
+            "object_family": "slippery",
+            "outcome": "timeout",
+            "safe_success": False,
+            "peak_force": 0.25,
+            "slip_events": 2,
+            "final_lift_height": 0.010,
+            "max_contacts": 2,
+        },
+        {
+            "object_family": "fragile",
+            "outcome": "damage",
+            "safe_success": False,
+            "peak_force": 1.20,
+            "slip_events": 0,
+            "final_lift_height": 0.020,
+            "max_contacts": 3,
+        },
+    ]
+
+    summary = summarize_evaluation_records(records)
+
+    assert classify_failure_mode(records[0]) == "success"
+    assert classify_failure_mode(records[1]) == "timeout_no_grip"
+    assert classify_failure_mode(records[2]) == "slip"
+    assert summary["safe_success_rate"] == pytest.approx(0.25)
+    assert summary["failure_modes"] == {"damage": 1, "slip": 1, "timeout_no_grip": 1}
+    assert summary["by_family"]["rounded"]["safe_success_rate"] == pytest.approx(0.5)
+    assert set(summary["by_family"]) == {"fragile", "rounded", "slippery"}
+    assert "object_name" not in summary
 
 
 class PublicOnlyController:
@@ -136,17 +205,16 @@ class PublicOnlyController:
 
 def test_evaluator_does_not_supply_hidden_object_or_render_state_to_controller() -> None:
     public = public_controller_info(
-        {"phase": "probe", "step": 1, "outcome": None, "object_params": {"name": "orange"}}
+        {"phase": "probe", "step": 1, "outcome": None, "object_params": {"name": "reference_object"}}
     )
     assert public == {"phase": "probe", "step": 1, "outcome": None}
 
     records = run_evaluation(
         PublicOnlyController,
-        build_locked_suite("test_household", limit=1),
+        build_locked_suite("validation_procedural", limit=1),
         controller_name="public_only",
         env_config=EnvConfig(exploration_steps=0, max_episode_steps=2),
     )
-    assert records[0]["object_name"] == "orange"
     assert records[0]["outcome"] == "timeout"
 
 
@@ -158,7 +226,7 @@ def test_overlay_draws_touch_panel_but_hides_object_identity_until_completion() 
         "phase": "explore",
         "pad_forces": np.array([0.2, 0.0, 0.0], dtype=np.float32),
         "peak_pad_force": 0.2,
-        "object_params": {"name": "orange"},
+        "object_params": {"name": "reference_object"},
         "outcome": None,
     }
     hidden = add_overlay(frame, observation, info, reveal_result=False)
@@ -172,7 +240,6 @@ def test_overlay_draws_touch_panel_but_hides_object_identity_until_completion() 
     assert hidden.shape == frame.shape
     assert np.any(hidden != frame)
     assert np.any(hidden != revealed)
-    assert demo_case("orange").object.name == "orange"
 
 
 def test_feasibility_report_preserves_seeded_physics_and_grouped_failures(tmp_path) -> None:
@@ -188,14 +255,14 @@ def test_feasibility_report_preserves_seeded_physics_and_grouped_failures(tmp_pa
     grouped = group_feasibility_failures(records)
     assert sum(group["count"] for group in grouped) == 3
     csv_path, jsonl_path, grouped_path = write_feasibility_report(
-        records, tmp_path / "oracle_gate"
+        records, tmp_path / "feasibility_gate"
     )
     assert csv_path.exists()
     assert jsonl_path.exists()
     assert json.loads(grouped_path.read_text(encoding="utf-8")) == grouped
 
 
-def test_feasibility_trajectory_search_records_declared_oracle_attempts() -> None:
+def test_feasibility_trajectory_search_records_declared_attempts() -> None:
     records = search_feasible_trajectories(
         seeds=range(1),
         env_config=EnvConfig(exploration_steps=0, max_episode_steps=2),

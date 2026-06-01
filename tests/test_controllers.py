@@ -5,8 +5,8 @@ import numpy as np
 
 from blindtouch.controllers import (
     FixedGripController,
-    OracleDebugController,
     ProbeThenLiftController,
+    PrivilegedFeasibilityController,
     SafeForceGripController,
     ThresholdGripController,
     per_finger_max_taxel_force,
@@ -14,8 +14,22 @@ from blindtouch.controllers import (
 from blindtouch.env import BlindTouchEnv, EnvConfig
 
 
+REFERENCE_OBJECT = {
+    "shape": "cylinder",
+    "half_size_x": 0.024,
+    "half_size_y": 0.024,
+    "half_size_z": 0.030,
+    "mass": 0.10,
+    "friction": 1.0,
+    "safe_force": 2.0,
+    "x_offset": 0.0,
+    "y_offset": 0.0,
+    "yaw": 0.0,
+}
+
+
 class PublicInfo(dict[str, Any]):
-    """Fail loudly if a non-oracle controller attempts to inspect hidden state."""
+    """Fail loudly if a public controller attempts to inspect hidden state."""
 
     def __getitem__(self, key: str) -> Any:
         if key in {"object_params", "pad_forces", "lift_height"}:
@@ -38,7 +52,7 @@ def run_episode(
             return info
 
 
-def test_non_oracle_controllers_use_observation_and_internal_timing_only() -> None:
+def test_public_controllers_use_observation_and_internal_timing_only() -> None:
     observation = np.zeros(45, dtype=np.float32)
     public_info = PublicInfo({"phase": "explore", "step": 0})
 
@@ -53,29 +67,6 @@ def test_non_oracle_controllers_use_observation_and_internal_timing_only() -> No
             action = controller.act(observation, public_info)
             assert action.shape == (4,)
             assert action.dtype == np.float32
-
-
-def test_demo_baselines_expose_failures_and_touch_adaptation() -> None:
-    env = BlindTouchEnv(config=EnvConfig(exploration_steps=0, max_episode_steps=120))
-    demo_objects = ("orange", "soap_bar", "tomato", "toy_car")
-
-    fixed_outcomes = [
-        run_episode(env, FixedGripController(), options={"demo_object": name})["outcome"]
-        for name in demo_objects
-    ]
-    threshold_outcomes = [
-        run_episode(env, ThresholdGripController(), options={"demo_object": name})["outcome"]
-        for name in demo_objects
-    ]
-    probe_outcomes = [
-        run_episode(env, ProbeThenLiftController(), options={"demo_object": name})["outcome"]
-        for name in demo_objects
-    ]
-
-    assert "damage" in fixed_outcomes
-    assert any(outcome != "success" for outcome in threshold_outcomes)
-    assert probe_outcomes == ["success"] * len(demo_objects)
-    env.close()
 
 
 def test_safe_force_controller_balances_individual_fingertip_taxels() -> None:
@@ -99,17 +90,18 @@ def test_safe_force_controller_balances_individual_fingertip_taxels() -> None:
     assert action[3] == 0.0
 
 
-def test_oracle_debug_controller_certifies_named_feasible_suite() -> None:
+def test_privileged_feasibility_controller_can_certify_a_reference_object() -> None:
     env = BlindTouchEnv(config=EnvConfig(exploration_steps=0, max_episode_steps=120))
-    outcomes = [
-        run_episode(env, OracleDebugController(), options={"demo_object": name})["outcome"]
-        for name in ("orange", "soap_bar", "tomato", "toy_car")
-    ]
-    assert outcomes == ["success"] * 4
+    result = run_episode(
+        env,
+        PrivilegedFeasibilityController(scripted_close_phases=((0.70, 30),)),
+        options={"object_params": REFERENCE_OBJECT},
+    )
+    assert result["outcome"] == "success"
     env.close()
 
 
-def test_training_archetype_baselines_smoke_run_is_nontrivial() -> None:
+def test_training_archetype_baselines_cover_distinct_outcomes() -> None:
     env = BlindTouchEnv(config=EnvConfig(exploration_steps=0, max_episode_steps=120))
     counts: dict[str, Counter[str]] = {}
     for controller_type in (

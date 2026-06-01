@@ -18,7 +18,6 @@ from .objects import (
     EpisodeObject,
     SamplingConfig,
     episode_object_from_mapping,
-    get_demo_object,
     sample_training_object,
 )
 
@@ -112,6 +111,22 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         "previous_action": slice(39, 43),
         "phase": slice(43, 45),
     }
+    REWARD_COMPONENT_NAMES = (
+        "time_cost",
+        "action_cost",
+        "force_cost",
+        "over_force_cost",
+        "probe_shaping",
+        "contact_shaping",
+        "contact_balance_shaping",
+        "safe_force_shaping",
+        "lift_progress",
+        "lift_readiness",
+        "stall_cost",
+        "slip_cost",
+        "terminal",
+        "timeout",
+    )
 
     def __init__(
         self,
@@ -166,49 +181,16 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
                 "object_wheel_rr_geom",
             )
         }
-        self._accent_geom_ids = tuple(
-            self.model.geom(name).id
-            for name in (
-                "object_accent_1_geom",
-                "object_accent_2_geom",
-                "object_accent_3_geom",
-                "object_accent_4_geom",
-                "object_accent_5_geom",
-                "object_accent_6_geom",
-                "object_accent_7_geom",
-                "object_accent_8_geom",
-                "object_accent_9_geom",
-                "object_accent_10_geom",
-            )
-        )
         self._mutable_object_geom_ids = (
             self._object_geom_id,
             *self._compound_geom_ids.values(),
-            *self._accent_geom_ids,
         )
         for geom_id in self._mutable_object_geom_ids:
             # MuJoCo optimizes XML geoms at identity as body-frame geoms. These
-            # placeholders are repositioned at reset time, so keep their local
-            # transforms active.
+            # mutable object geoms are repositioned at reset time, so keep their
+            # local transforms active.
             self.model.geom_sameframe[geom_id] = int(mujoco.mjtSameFrame.mjSAMEFRAME_NONE)
-        self._material_ids = {
-            name: self.model.material(name).id
-            for name in (
-                "object",
-                "orange_skin",
-                "fruit_leaf",
-                "tomato_skin",
-                "soap_body",
-                "soap_stamp",
-                "car_body",
-                "car_window",
-                "car_tire",
-                "car_lamp",
-                "car_tail_lamp",
-                "car_racing_stripe",
-                "car_hubcap",
-            )
-        }
+        self._material_ids = {"object": self.model.material("object").id}
         self._pad_geom_ids = np.array(
             [self.model.geom(f"finger_{finger}_pad").id for finger in range(1, 4)],
             dtype=np.int32,
@@ -258,6 +240,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._reset_valid = True
         self._rejected_reset_samples = 0
         self._lift_attempt_steps = 0
+        self._last_reward_components = self._empty_reward_components()
 
     def reset(
         self,
@@ -269,9 +252,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
 
         super().reset(seed=seed)
         episode_options = options or {}
-        randomized_reset = not any(
-            key in episode_options for key in ("object", "object_params", "demo_object")
-        )
+        randomized_reset = not any(key in episode_options for key in ("object", "object_params"))
         self._rejected_reset_samples = 0
         for _ in range(self.config.max_reset_attempts):
             mujoco.mj_resetData(self.model, self.data)
@@ -318,6 +299,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         self._initial_palm_height = float(self.data.qpos[self._palm_qpos_adr])
         self._outcome = None
         self._lift_attempt_steps = 0
+        self._last_reward_components = self._empty_reward_components()
 
         observation = self._observation()
         info = self._info()
@@ -435,7 +417,9 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         truncated = bool(not terminated and self._step_count >= self.config.max_episode_steps)
         if truncated:
             self._outcome = "timeout"
-            reward -= self._timeout_penalty()
+            timeout_penalty = self._timeout_penalty()
+            self._last_reward_components["timeout"] = -timeout_penalty
+            reward -= timeout_penalty
 
         self._previous_lift_height = lift_height
         self._previous_object_xy = object_xy
@@ -446,7 +430,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         return observation, float(reward), terminated, truncated, info
 
     def render(self) -> NDArray[np.uint8] | None:
-        """Render the scene for demonstrations, never as a policy observation."""
+        """Render the scene without adding pixels to the policy observation."""
 
         if self.render_mode == "rgb_array":
             if self._renderer is None:
@@ -475,8 +459,6 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             if not isinstance(provided_object, EpisodeObject):
                 raise TypeError("options['object'] must be an EpisodeObject")
             return provided_object
-        if "demo_object" in options:
-            return get_demo_object(str(options["demo_object"]), options.get("pose"))
         if "object_params" in options:
             provided_params = options["object_params"]
             if not isinstance(provided_params, Mapping):
@@ -600,173 +582,13 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             self.model.geom_conaffinity[pad_id] = 4
 
     def _configure_visual_geometry(self, params: EpisodeObject) -> None:
+        del params
         self._show_material(self._object_geom_id, "object")
-        for geom_id in self._accent_geom_ids:
-            self.model.geom_matid[geom_id] = -1
-            self.model.geom_rgba[geom_id] = (0.0, 0.0, 0.0, 0.0)
-            self.model.geom_pos[geom_id] = (0.0, 0.0, 0.0)
-            self.model.geom_quat[geom_id] = (1.0, 0.0, 0.0, 0.0)
-
-        if params.visual_style == "orange":
-            self._show_material(self._object_geom_id, "orange_skin")
-            self._set_accent(
-                0,
-                geom_type=mujoco.mjtGeom.mjGEOM_CYLINDER,
-                size=(0.002, 0.004, 0.0),
-                position=(0.0, 0.0, params.half_size_z + 0.003),
-                material="fruit_leaf",
-            )
-            self._set_accent(
-                1,
-                geom_type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
-                size=(0.006, 0.003, 0.001),
-                position=(0.004, 0.0, params.half_size_z + 0.005),
-                material="fruit_leaf",
-            )
-        elif params.visual_style == "tomato":
-            self._show_material(self._object_geom_id, "tomato_skin")
-            self._set_accent(
-                0,
-                geom_type=mujoco.mjtGeom.mjGEOM_CYLINDER,
-                size=(0.0015, 0.003, 0.0),
-                position=(0.0, 0.0, params.half_size_z + 0.002),
-                material="fruit_leaf",
-            )
-            self._set_accent(
-                1,
-                geom_type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
-                size=(0.009, 0.0035, 0.001),
-                position=(0.002, 0.0, params.half_size_z + 0.002),
-                material="fruit_leaf",
-            )
-        elif params.visual_style == "soap_bar":
-            self.model.geom_matid[self._object_geom_id] = -1
-            self.model.geom_rgba[self._object_geom_id] = (0.0, 0.0, 0.0, 0.0)
-            self._set_accent(
-                0,
-                geom_type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
-                size=(params.half_size_x, params.half_size_y, params.half_size_z),
-                position=(0.0, 0.0, 0.0),
-                material="soap_body",
-            )
-            self._set_accent(
-                1,
-                geom_type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
-                size=(0.012, 0.007, 0.0008),
-                position=(0.0, 0.0, params.half_size_z + 0.0007),
-                material="soap_stamp",
-            )
-        elif params.visual_style == "toy_car":
-            self._show_material(self._object_geom_id, "car_body")
-            self._show_material(self._compound_geom_ids["object_cabin_geom"], "car_window")
-            for name in (
-                "object_wheel_fl_geom",
-                "object_wheel_fr_geom",
-                "object_wheel_rl_geom",
-                "object_wheel_rr_geom",
-            ):
-                self._show_material(self._compound_geom_ids[name], "car_tire")
-            body_top_z = (
-                self.model.geom_pos[self._object_geom_id, 2]
-                + self.model.geom_size[self._object_geom_id, 2]
-            )
-            cabin_top_z = (
-                self.model.geom_pos[self._compound_geom_ids["object_cabin_geom"], 2]
-                + self.model.geom_size[self._compound_geom_ids["object_cabin_geom"], 2]
-            )
-            lamp_z = body_top_z - 0.002
-            self._set_accent(
-                0,
-                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=(0.0015, 0.0045, 0.0020),
-                position=(params.half_size_x * 0.86, params.half_size_y * 0.42, lamp_z),
-                material="car_lamp",
-            )
-            self._set_accent(
-                1,
-                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=(0.0015, 0.0045, 0.0020),
-                position=(params.half_size_x * 0.86, -params.half_size_y * 0.42, lamp_z),
-                material="car_lamp",
-            )
-            self._set_accent(
-                2,
-                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=(0.0013, 0.0038, 0.0018),
-                position=(-params.half_size_x * 0.86, params.half_size_y * 0.42, lamp_z),
-                material="car_tail_lamp",
-            )
-            self._set_accent(
-                3,
-                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=(0.0013, 0.0038, 0.0018),
-                position=(-params.half_size_x * 0.86, -params.half_size_y * 0.42, lamp_z),
-                material="car_tail_lamp",
-            )
-            self._set_accent(
-                4,
-                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=(0.026, 0.0012, 0.0030),
-                position=(
-                    0.0,
-                    self.model.geom_size[self._object_geom_id, 1] + 0.0012,
-                    self.model.geom_pos[self._object_geom_id, 2] + 0.0010,
-                ),
-                material="car_racing_stripe",
-            )
-            self._set_accent(
-                5,
-                geom_type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=(0.026, 0.0012, 0.0030),
-                position=(
-                    0.0,
-                    -self.model.geom_size[self._object_geom_id, 1] - 0.0012,
-                    self.model.geom_pos[self._object_geom_id, 2] + 0.0010,
-                ),
-                material="car_racing_stripe",
-            )
-            for accent_index, wheel_name in enumerate(
-                (
-                    "object_wheel_fl_geom",
-                    "object_wheel_fr_geom",
-                    "object_wheel_rl_geom",
-                    "object_wheel_rr_geom",
-                ),
-                start=6,
-            ):
-                wheel_id = self._compound_geom_ids[wheel_name]
-                position = self.model.geom_pos[wheel_id].copy()
-                side = 1.0 if position[1] >= 0.0 else -1.0
-                wheel_radius = float(self.model.geom_size[wheel_id, 0])
-                position[1] += side * wheel_radius * 0.80
-                self._set_accent(
-                    accent_index,
-                    geom_type=mujoco.mjtGeom.mjGEOM_SPHERE,
-                    size=(wheel_radius * 0.55, 0.0, 0.0),
-                    position=tuple(float(value) for value in position),
-                    material="car_hubcap",
-                )
 
     def _show_material(self, geom_id: int, material: str) -> None:
         material_id = self._material_ids[material]
         self.model.geom_matid[geom_id] = material_id
         self.model.geom_rgba[geom_id] = self.model.mat_rgba[material_id]
-
-    def _set_accent(
-        self,
-        index: int,
-        *,
-        geom_type: mujoco.mjtGeom,
-        size: tuple[float, float, float],
-        position: tuple[float, float, float],
-        material: str,
-    ) -> None:
-        geom_id = self._accent_geom_ids[index]
-        self.model.geom_type[geom_id] = int(geom_type)
-        self.model.geom_size[geom_id] = size
-        self.model.geom_pos[geom_id] = position
-        self.model.geom_rbound[geom_id] = float(np.linalg.norm(size))
-        self._show_material(geom_id, material)
 
     @staticmethod
     def _geom_type(shape: str) -> int:
@@ -849,50 +671,67 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
         contact_count = int(grip_metrics["contact_count"])
         grip_score = float(grip_metrics["grip_score"])
         balance_score = float(grip_metrics["balance_score"])
-        reward = -0.004
-        reward -= 0.001 * float(np.mean(np.square(action)))
-        reward -= 0.003 * force_fraction**2
+        components = self._empty_reward_components()
+        components["time_cost"] = -0.004
+        components["action_cost"] = -0.001 * float(np.mean(np.square(action)))
+        components["force_cost"] = -0.003 * force_fraction**2
         if force_fraction > 0.70:
-            reward -= 0.080 * (force_fraction - 0.70) ** 2
+            components["over_force_cost"] -= 0.080 * (force_fraction - 0.70) ** 2
 
         finger_closing = np.clip(action[1:], 0.0, 1.0)
         mean_finger_close = float(np.mean(finger_closing))
         close_symmetry = 1.0 - float(np.std(finger_closing))
         if not lift_allowed and contact_count < 2:
-            reward += (
+            components["probe_shaping"] += (
                 self.config.coordinated_probe_reward_scale
                 * mean_finger_close
                 * np.clip(close_symmetry, 0.0, 1.0)
             )
-        reward += self.config.contact_reward_scale * grip_score
+        components["contact_shaping"] += self.config.contact_reward_scale * grip_score
         if contact_count >= 2:
-            reward += self.config.contact_balance_reward_scale * balance_score
+            components["contact_balance_shaping"] += (
+                self.config.contact_balance_reward_scale * balance_score
+            )
             safe_margin_score = float(np.clip((0.62 - force_fraction) / 0.62, 0.0, 1.0))
-            reward += self.config.safe_force_band_reward_scale * grip_score * safe_margin_score
+            components["safe_force_shaping"] += (
+                self.config.safe_force_band_reward_scale * grip_score * safe_margin_score
+            )
         elif contact_count == 1:
             strongest_contact = float(np.max(pad_forces) / grip_metrics["target_pad_force"])
-            reward -= self.config.single_contact_penalty * min(strongest_contact, 2.0)
+            components["contact_shaping"] -= (
+                self.config.single_contact_penalty * min(strongest_contact, 2.0)
+            )
         elif self._step_count > 8:
-            reward -= self.config.no_contact_penalty * (1.0 - grip_score)
+            components["contact_shaping"] -= (
+                self.config.no_contact_penalty * (1.0 - grip_score)
+            )
         if force_fraction > 0.55:
-            reward -= self.config.over_force_penalty_scale * (force_fraction - 0.55) ** 2
+            components["over_force_cost"] -= (
+                self.config.over_force_penalty_scale * (force_fraction - 0.55) ** 2
+            )
 
         if lift_allowed:
-            reward += (
+            components["lift_progress"] += (
                 self.config.lift_progress_reward_scale
                 * (lift_height - self._previous_lift_height)
                 / self.config.lift_target_height
             )
             lift_request = max(float(action[0]), 0.0)
             if lift_request > 0.0 and grip_score < 0.45:
-                reward -= self.config.premature_lift_penalty * lift_request * (1.0 - grip_score)
+                components["lift_readiness"] -= (
+                    self.config.premature_lift_penalty * lift_request * (1.0 - grip_score)
+                )
             elif lift_request > 0.0 and contact_count >= 2:
-                reward += self.config.ready_lift_bonus * lift_request * grip_score
+                components["lift_readiness"] += (
+                    self.config.ready_lift_bonus * lift_request * grip_score
+                )
             lift_fraction = float(
                 np.clip(lift_height / self.config.lift_target_height, 0.0, 1.0)
             )
             if contact_count >= 2 and lift_height > 0.0:
-                reward += self.config.lifted_grip_reward_scale * grip_score * lift_fraction
+                components["lift_progress"] += (
+                    self.config.lifted_grip_reward_scale * grip_score * lift_fraction
+                )
             if (
                 self._step_count > self.config.exploration_steps + 12
                 and contact_count >= 2
@@ -903,20 +742,26 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
                 stalled_fraction = 1.0 - float(
                     np.clip(lift_height / self.config.attempted_lift_height, 0.0, 1.0)
                 )
-                reward -= self.config.grip_stall_penalty * grip_score * stalled_fraction
+                components["stall_cost"] -= (
+                    self.config.grip_stall_penalty * grip_score * stalled_fraction
+                )
             if self._step_count > self.config.exploration_steps + 12 and contact_count == 0:
-                reward -= self.config.no_contact_penalty
+                components["contact_shaping"] -= self.config.no_contact_penalty
         if slipped:
-            reward -= 0.25
+            components["slip_cost"] -= 0.25
         if damaged:
-            reward -= self.config.damage_penalty
+            components["terminal"] -= self.config.damage_penalty
         elif unstable:
-            reward -= self.config.unstable_penalty
+            components["terminal"] -= self.config.unstable_penalty
         elif dropped:
-            reward -= self.config.drop_penalty
+            components["terminal"] -= self.config.drop_penalty
         elif succeeded:
-            reward += self.config.success_reward
-        return reward
+            components["terminal"] += self.config.success_reward
+        self._last_reward_components = components
+        return float(sum(components.values()))
+
+    def _empty_reward_components(self) -> dict[str, float]:
+        return {name: 0.0 for name in self.REWARD_COMPONENT_NAMES}
 
     def _timeout_penalty(self) -> float:
         penalty = self.config.timeout_penalty
@@ -1022,6 +867,7 @@ class BlindTouchEnv(gym.Env[FloatArray, FloatArray]):
             "slip_events": self._slip_events,
             "cumulative_slip_distance": self._cumulative_slip_distance,
             "lift_attempt_steps": self._lift_attempt_steps,
+            "reward_components": dict(self._last_reward_components),
             "initial_palm_height": self._initial_palm_height,
             "initial_penetration": self._initial_penetration,
             "settle_xy_displacement": self._settle_xy_displacement,

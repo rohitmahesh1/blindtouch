@@ -1,8 +1,8 @@
 """Auditable scripted controllers for BlindTouch baseline evaluation.
 
-Non-oracle controllers consume only the policy observation and their own
-command counter.  The oracle controller is intentionally privileged and exists
-only to detect task instances that are not safely liftable by the mechanics.
+Standard controllers consume only the policy observation and their own command
+counter. The feasibility controller is intentionally privileged and exists only
+to detect task instances that are not safely liftable by the mechanics.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ DEFAULT_TACTILE_FORCE_SCALE = 5.0
 
 
 class Controller(Protocol):
-    """Small controller contract shared by baselines and future evaluation."""
+    """Controller contract shared by baselines and evaluation."""
 
     def reset(self, observation: Observation, info: Mapping[str, Any]) -> None:
         """Begin a new episode."""
@@ -114,7 +114,7 @@ class ThresholdGripController:
 class SafeForceGripController:
     """Balance fingertip forces in a modest tactile band before lifting.
 
-    This is intentionally a non-oracle teacher: it only reads taxels and timing,
+    This controller only reads taxels and timing,
     not hidden mass, friction, safe-force limits, labels, or diagnostic pad force.
     """
 
@@ -274,7 +274,7 @@ class ProbeThenLiftController:
 
 
 @dataclass
-class OracleDebugController:
+class PrivilegedFeasibilityController:
     """Privileged feasibility controller; never report it as a baseline."""
 
     scripted_close_phases: tuple[tuple[float, int], ...] | None = None
@@ -290,32 +290,18 @@ class OracleDebugController:
     _safe_force: float = field(init=False, default=0.0)
     _active_lift_rate: float = field(init=False, default=1.0)
 
-    _DEMO_PHASES = {
-        "orange": ((0.26, 63),),
-        "soap_bar": ((0.20, 84),),
-        "tomato": ((0.40, 38), (0.05, 23)),
-        "toy_car": ((0.20, 80),),
-    }
-    _DEMO_LIFT_RATES = {
-        "orange": 0.70,
-    }
-
     def reset(self, observation: Observation, info: Mapping[str, Any]) -> None:
         del observation
         params = info["object_params"]
-        name = str(params["name"])
         if self.scripted_close_phases is not None:
             self._mode = "scripted"
             self._phases = self.scripted_close_phases
-        elif name in self._DEMO_PHASES:
-            self._mode = "scripted"
-            self._phases = self._DEMO_PHASES[name]
         else:
             self._mode = "force_balance"
             self._phases = ()
         self._safe_force = float(params["safe_force"])
         self._force_target = self._safe_force * 0.55
-        self._active_lift_rate = self._DEMO_LIFT_RATES.get(name, self.lift_rate)
+        self._active_lift_rate = self.lift_rate
         self._stable_steps = 0
         self._lifting = False
         self._step = 0
@@ -362,7 +348,7 @@ class OracleDebugController:
 __all__ = [
     "Controller",
     "FixedGripController",
-    "OracleDebugController",
+    "PrivilegedFeasibilityController",
     "ProbeThenLiftController",
     "SafeForceGripController",
     "ThresholdGripController",

@@ -15,6 +15,12 @@ import numpy as np
 Quaternion = tuple[float, float, float, float]
 FloatRange = tuple[float, float]
 SUPPORTED_GEOMS = ("cylinder", "box", "capsule", "ellipsoid", "chassis")
+TOUCH_SKILL_MODES = (
+    "round_retention",
+    "rigid_asymmetric",
+    "slippery_retention",
+    "fragile_balance",
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,7 @@ class ObjectFamily:
     safe_force_range: FloatRange
     visual_style: str
     stable_poses: tuple[StablePose, ...]
+    skill_modes: tuple[str, ...]
     evaluation_tags: tuple[str, ...] = ()
 
 
@@ -79,7 +86,14 @@ class EpisodeObject:
 class SamplingConfig:
     """Training distribution controls shared by training and evaluation code."""
 
-    training_families: tuple[str, ...] = ("rounded", "container", "package", "chassis")
+    training_families: tuple[str, ...] = (
+        "rounded",
+        "container",
+        "package",
+        "slippery",
+        "fragile",
+        "chassis",
+    )
     allowed_poses: tuple[str, ...] | None = None
     offset_range: FloatRange = (-0.006, 0.006)
     friction_range: FloatRange | None = None
@@ -101,10 +115,7 @@ SIDE_Y = StablePose(
     (float(np.cos(np.pi / 4.0)), float(np.sin(np.pi / 4.0)), 0.0, 0.0),
     "y",
 )
-ORIENTATION_FREE = StablePose("orientation_free", (1.0, 0.0, 0.0, 0.0), "z")
 WHEELS_DOWN = StablePose("wheels_down", (1.0, 0.0, 0.0, 0.0), "z", (-0.35, 0.35))
-EDGE_RESTING = StablePose("edge_resting", SIDE_Y.quaternion, "y", (-0.7, 0.7))
-CAR_SIDE_RESTING = StablePose("side_resting", SIDE_Y.quaternion, "y", (-0.25, 0.25))
 
 
 TRAINING_FAMILIES: dict[str, ObjectFamily] = {
@@ -119,7 +130,8 @@ TRAINING_FAMILIES: dict[str, ObjectFamily] = {
         safe_force_range=(0.40, 2.80),
         visual_style="abstract_rounded",
         stable_poses=(UPRIGHT,),
-        evaluation_tags=("training", "rounded"),
+        skill_modes=("round_retention",),
+        evaluation_tags=("training", "rounded", "round_retention"),
     ),
     "container": ObjectFamily(
         identifier="container",
@@ -132,7 +144,8 @@ TRAINING_FAMILIES: dict[str, ObjectFamily] = {
         safe_force_range=(0.40, 2.80),
         visual_style="abstract_container",
         stable_poses=(UPRIGHT, SIDE_X),
-        evaluation_tags=("training", "container"),
+        skill_modes=("round_retention", "slippery_retention"),
+        evaluation_tags=("training", "container", "round_retention"),
     ),
     "package": ObjectFamily(
         identifier="package",
@@ -145,7 +158,36 @@ TRAINING_FAMILIES: dict[str, ObjectFamily] = {
         safe_force_range=(0.40, 2.80),
         visual_style="abstract_package",
         stable_poses=(UPRIGHT, SIDE_X, SIDE_Y),
-        evaluation_tags=("training", "package"),
+        skill_modes=("rigid_asymmetric",),
+        evaluation_tags=("training", "package", "rigid_asymmetric"),
+    ),
+    "slippery": ObjectFamily(
+        identifier="slippery",
+        collision_kinds=("box", "cylinder", "capsule", "ellipsoid"),
+        half_size_x_range=(0.021, 0.035),
+        half_size_y_range=(0.020, 0.034),
+        half_size_z_range=(0.014, 0.042),
+        mass_range=(0.030, 0.150),
+        friction_range=(0.16, 0.36),
+        safe_force_range=(0.70, 3.00),
+        visual_style="abstract_slippery",
+        stable_poses=(UPRIGHT, SIDE_X, SIDE_Y),
+        skill_modes=("slippery_retention",),
+        evaluation_tags=("training", "slippery", "slippery_retention"),
+    ),
+    "fragile": ObjectFamily(
+        identifier="fragile",
+        collision_kinds=("ellipsoid", "box", "cylinder"),
+        half_size_x_range=(0.022, 0.033),
+        half_size_y_range=(0.021, 0.033),
+        half_size_z_range=(0.018, 0.038),
+        mass_range=(0.025, 0.090),
+        friction_range=(0.65, 1.20),
+        safe_force_range=(0.28, 0.90),
+        visual_style="abstract_fragile",
+        stable_poses=(UPRIGHT, SIDE_X, SIDE_Y),
+        skill_modes=("fragile_balance",),
+        evaluation_tags=("training", "fragile", "fragile_balance"),
     ),
     "chassis": ObjectFamily(
         identifier="chassis",
@@ -158,150 +200,9 @@ TRAINING_FAMILIES: dict[str, ObjectFamily] = {
         safe_force_range=(0.70, 2.80),
         visual_style="abstract_chassis",
         stable_poses=(WHEELS_DOWN,),
-        evaluation_tags=("training", "compound"),
+        skill_modes=("rigid_asymmetric",),
+        evaluation_tags=("training", "compound", "rigid_asymmetric"),
     )
-}
-
-
-DEMO_OBJECT_POSES: dict[str, dict[str, EpisodeObject]] = {
-    "orange": {
-        "orientation_free": EpisodeObject(
-        family="household",
-        name="orange",
-        shape="ellipsoid",
-        pose="orientation_free",
-        quaternion=ORIENTATION_FREE.quaternion,
-        half_size_x=0.031,
-        half_size_y=0.031,
-        half_size_z=0.031,
-        mass=0.120,
-        friction=0.69,
-        safe_force=0.92,
-        x_offset=0.0,
-        y_offset=0.0,
-        yaw=0.0,
-        resting_half_height=0.031,
-        grasp_height=0.031,
-        visual_style="orange",
-        evaluation_tags=("demo", "held_out", "gentle"),
-        )
-    },
-    "soap_bar": {
-        "broad_face": EpisodeObject(
-        family="household",
-        name="soap_bar",
-        shape="box",
-        pose="broad_face",
-        quaternion=UPRIGHT.quaternion,
-        half_size_x=0.0325,
-        half_size_y=0.021,
-        half_size_z=0.0125,
-        mass=0.095,
-        friction=0.22,
-        safe_force=2.00,
-        x_offset=0.0,
-        y_offset=0.0,
-        yaw=0.0,
-        resting_half_height=0.0125,
-        grasp_height=0.020,
-        visual_style="soap_bar",
-        evaluation_tags=("demo", "held_out", "slippery"),
-        ),
-        "edge_resting": EpisodeObject(
-            family="household",
-            name="soap_bar",
-            shape="box",
-            pose="edge_resting",
-            quaternion=EDGE_RESTING.quaternion,
-            half_size_x=0.0325,
-            half_size_y=0.021,
-            half_size_z=0.0125,
-            mass=0.095,
-            friction=0.22,
-            safe_force=2.00,
-            x_offset=0.0,
-            y_offset=0.0,
-            yaw=0.0,
-            resting_half_height=0.021,
-            grasp_height=0.021,
-            visual_style="soap_bar",
-            evaluation_tags=("demo", "held_out", "slippery", "alternate_pose"),
-        ),
-    },
-    "tomato": {
-        "orientation_free": EpisodeObject(
-        family="household",
-        name="tomato",
-        shape="ellipsoid",
-        pose="orientation_free",
-        quaternion=ORIENTATION_FREE.quaternion,
-        half_size_x=0.030,
-        half_size_y=0.030,
-        half_size_z=0.028,
-        mass=0.100,
-        friction=0.80,
-        safe_force=0.55,
-        x_offset=0.0,
-        y_offset=0.0,
-        yaw=0.0,
-        resting_half_height=0.028,
-        grasp_height=0.028,
-        visual_style="tomato",
-        evaluation_tags=("demo", "held_out", "fragile"),
-        )
-    },
-    "toy_car": {
-        "wheels_down": EpisodeObject(
-        family="household",
-        name="toy_car",
-        shape="chassis",
-        pose="wheels_down",
-        quaternion=WHEELS_DOWN.quaternion,
-        half_size_x=0.0375,
-        half_size_y=0.0225,
-        half_size_z=0.0175,
-        mass=0.090,
-        friction=0.55,
-        safe_force=1.80,
-        x_offset=0.0,
-        y_offset=0.0,
-        yaw=0.0,
-        resting_half_height=0.0175,
-        grasp_height=0.022,
-        visual_style="toy_car",
-        evaluation_tags=("demo", "held_out", "compound_collision"),
-        ),
-        "side_resting": EpisodeObject(
-            family="household",
-            name="toy_car",
-            shape="chassis",
-            pose="side_resting",
-            quaternion=CAR_SIDE_RESTING.quaternion,
-            half_size_x=0.0375,
-            half_size_y=0.0225,
-            half_size_z=0.0175,
-            mass=0.090,
-            friction=0.55,
-            safe_force=1.80,
-            x_offset=0.0,
-            y_offset=0.0,
-            yaw=0.0,
-            resting_half_height=0.0225,
-            grasp_height=0.0225,
-            visual_style="toy_car",
-            evaluation_tags=("demo", "held_out", "compound_collision", "alternate_pose"),
-        ),
-    },
-}
-
-DEMO_DEFAULT_POSES = {
-    "orange": "orientation_free",
-    "soap_bar": "broad_face",
-    "tomato": "orientation_free",
-    "toy_car": "wheels_down",
-}
-DEMO_PROXIES = {
-    name: DEMO_OBJECT_POSES[name][pose] for name, pose in DEMO_DEFAULT_POSES.items()
 }
 
 
@@ -315,6 +216,9 @@ def sample_training_object(
     if family_name not in TRAINING_FAMILIES:
         raise ValueError(f"Unsupported active training family: {family_name!r}")
     family = TRAINING_FAMILIES[family_name]
+    for mode in family.skill_modes:
+        if mode not in TOUCH_SKILL_MODES:
+            raise ValueError(f"Family {family.identifier!r} declares unknown skill mode {mode!r}")
     shape = str(rng.choice(family.collision_kinds))
     stable_poses = (
         family.stable_poses
@@ -364,26 +268,6 @@ def sample_training_object(
         visual_style=family.visual_style,
         evaluation_tags=family.evaluation_tags,
     )
-
-
-def get_demo_object(name: str, pose: str | None = None) -> EpisodeObject:
-    """Return a held-out household object in a deterministic stable pose."""
-
-    if name not in DEMO_OBJECT_POSES:
-        raise ValueError(f"Unknown demo object: {name!r}")
-    selected_pose = pose or DEMO_DEFAULT_POSES[name]
-    if selected_pose not in DEMO_OBJECT_POSES[name]:
-        valid = tuple(DEMO_OBJECT_POSES[name])
-        raise ValueError(f"Object {name!r} does not support pose {selected_pose!r}; valid poses: {valid}")
-    return DEMO_OBJECT_POSES[name][selected_pose]
-
-
-def demo_object_poses(name: str) -> tuple[str, ...]:
-    """List the deterministic stable poses available for a named demo object."""
-
-    if name not in DEMO_OBJECT_POSES:
-        raise ValueError(f"Unknown demo object: {name!r}")
-    return tuple(DEMO_OBJECT_POSES[name])
 
 
 def episode_object_from_mapping(values: Mapping[str, object]) -> EpisodeObject:
@@ -504,16 +388,12 @@ def _quaternion_multiply(first: Quaternion, second: Quaternion) -> Quaternion:
 
 
 __all__ = [
-    "DEMO_PROXIES",
-    "DEMO_DEFAULT_POSES",
-    "DEMO_OBJECT_POSES",
     "EpisodeObject",
     "ObjectFamily",
     "SamplingConfig",
     "StablePose",
+    "TOUCH_SKILL_MODES",
     "TRAINING_FAMILIES",
-    "demo_object_poses",
     "episode_object_from_mapping",
-    "get_demo_object",
     "sample_training_object",
 ]
