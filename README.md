@@ -54,15 +54,6 @@ Household-style objects are used to visualize transfer behavior, while the
 training and evaluation pipeline remains grounded in randomized procedural
 objects.
 
-Project Structure
------------------
-
-- `blindtouch/assets/claw.xml`: MuJoCo claw and scene definition.
-- `blindtouch/env.py`: Gymnasium environment and tactile observation contract.
-- `blindtouch/objects.py`: procedural object families and visual presets.
-- `blindtouch/hierarchical_bc.py`: hierarchical behavior-cloning policy.
-- `blindtouch/safety.py`: tactile safety filtering.
-- `blindtouch/train.py`: training, warm starts, evaluation, and checkpoint
-  selection.
-- `scratch/render_household_showcase.py`: local showcase renderer.
-- `assets/blindtouch_model_flow.svg`: system flow diagram.
+BlindTouch includes PPO/SAC reinforcement-learning experiments, but the
+strongest current controller is a hierarchical behavior-cloned tactile policy
+with safety filtering.
