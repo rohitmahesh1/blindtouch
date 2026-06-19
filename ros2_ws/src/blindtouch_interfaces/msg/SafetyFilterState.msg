@@ -1,0 +1,10 @@
+std_msgs/Header header
+bool intervened
+float32 max_force
+float32 max_force_rate
+uint32 contact_count
+uint32 ready_count
+uint32 stable_steps
+float32[4] raw_action
+float32[4] filtered_action
+float32[4] residual
