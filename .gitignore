@@ -1,5 +1,8 @@
 # Virtual environments and local configuration
 .venv/
+.pixi/
+.ros/
+.tools/
 .env
 .env.local
 .envrc
@@ -18,6 +21,9 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
 
 # Local logs and notes
 log.txt
