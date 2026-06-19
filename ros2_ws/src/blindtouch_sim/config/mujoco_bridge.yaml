@@ -1,0 +1,16 @@
+blindtouch_mujoco_bridge:
+  ros__parameters:
+    xml_path: ""
+    camera_name: "overview"
+    frame_id: "blindtouch_world"
+    seed: 0
+    use_seed: true
+    publish_rate_hz: 25.0
+    auto_reset: false
+    physics_steps_per_action: 20
+    exploration_steps: 30
+    max_episode_steps: 120
+    command_topic: "blindtouch/command"
+    joint_state_topic: "blindtouch/joint_states"
+    tactile_topic: "blindtouch/tactile"
+    sim_state_topic: "blindtouch/sim_state"
