@@ -1,3 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blindtouch"
+version = "0.1.0"
+description = "MuJoCo and Gymnasium tactile manipulation stack for a three-finger claw."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "gymnasium",
+  "mujoco",
+  "numpy",
+]
+
+[project.optional-dependencies]
+learning = [
+  "stable-baselines3",
+  "torch",
+]
+test = [
+  "pytest",
+]
+
+[tool.setuptools.packages.find]
+include = ["blindtouch*"]
+
+[tool.setuptools.package-data]
+blindtouch = ["assets/*.xml", "assets/objects/*.obj"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
