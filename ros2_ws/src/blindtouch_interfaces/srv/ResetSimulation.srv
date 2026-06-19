@@ -1,0 +1,5 @@
+bool use_seed
+int32 seed
+---
+bool ok
+string message
