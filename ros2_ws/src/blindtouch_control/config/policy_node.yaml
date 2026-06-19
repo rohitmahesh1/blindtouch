@@ -1,0 +1,14 @@
+blindtouch_policy_node:
+  ros__parameters:
+    checkpoint_path: ""
+    device: "auto"
+    output_topic: "blindtouch/raw_command"
+    tactile_topic: "blindtouch/tactile"
+    joint_state_topic: "blindtouch/joint_states"
+    sim_state_topic: "blindtouch/sim_state"
+    publish_rate_hz: 25.0
+    tactile_force_scale: 5.0
+    velocity_scale: 0.5
+    max_episode_steps: 120
+    history_length: 8
+    publish_zero_without_checkpoint: false
