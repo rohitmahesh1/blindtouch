@@ -1,0 +1,6 @@
+topics:
+  command: "blindtouch/command"
+  joint_states: "blindtouch/joint_states"
+  tactile: "blindtouch/tactile"
+  sim_state: "blindtouch/sim_state"
+  reset_service: "blindtouch/reset"
