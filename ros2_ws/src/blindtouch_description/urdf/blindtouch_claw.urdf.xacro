@@ -1,0 +1,217 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="blindtouch_claw">
+  <!--
+    ROS visualization/control description aligned with blindtouch/assets/claw.xml.
+    MJCF remains the canonical physics model; this file preserves the ROS link,
+    joint, visual, collision, and tactile-frame layout for RViz and hardware work.
+  -->
+
+  <material name="floor">
+    <color rgba="0.18 0.21 0.25 1"/>
+  </material>
+  <material name="frame">
+    <color rgba="0.28 0.34 0.42 1"/>
+  </material>
+  <material name="rail">
+    <color rgba="0.42 0.48 0.55 1"/>
+  </material>
+  <material name="pad">
+    <color rgba="0.12 0.55 0.70 1"/>
+  </material>
+  <material name="taxel">
+    <color rgba="0.95 0.25 0.10 0.35"/>
+  </material>
+  <material name="pad_zone">
+    <color rgba="0.12 0.55 0.70 0.10"/>
+  </material>
+  <material name="site_green">
+    <color rgba="0.30 0.85 0.40 1"/>
+  </material>
+  <material name="site_yellow">
+    <color rgba="0.95 0.95 0.20 0.5"/>
+  </material>
+
+  <xacro:macro name="visual_collision_box" params="name xyz rpy size material">
+    <visual name="${name}_visual">
+      <origin xyz="${xyz}" rpy="${rpy}"/>
+      <geometry>
+        <box size="${size}"/>
+      </geometry>
+      <material name="${material}"/>
+    </visual>
+    <collision name="${name}_collision">
+      <origin xyz="${xyz}" rpy="${rpy}"/>
+      <geometry>
+        <box size="${size}"/>
+      </geometry>
+    </collision>
+  </xacro:macro>
+
+  <xacro:macro name="visual_collision_cylinder" params="name xyz rpy radius length material">
+    <visual name="${name}_visual">
+      <origin xyz="${xyz}" rpy="${rpy}"/>
+      <geometry>
+        <cylinder radius="${radius}" length="${length}"/>
+      </geometry>
+      <material name="${material}"/>
+    </visual>
+    <collision name="${name}_collision">
+      <origin xyz="${xyz}" rpy="${rpy}"/>
+      <geometry>
+        <cylinder radius="${radius}" length="${length}"/>
+      </geometry>
+    </collision>
+  </xacro:macro>
+
+  <xacro:macro name="fixed_sphere_marker" params="name parent xyz radius material">
+    <link name="${name}">
+      <visual name="${name}_visual">
+        <geometry>
+          <sphere radius="${radius}"/>
+        </geometry>
+        <material name="${material}"/>
+      </visual>
+    </link>
+    <joint name="${name}_fixed" type="fixed">
+      <parent link="${parent}"/>
+      <child link="${name}"/>
+      <origin xyz="${xyz}" rpy="0 0 0"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:macro name="fixed_box_marker" params="name parent xyz size material">
+    <link name="${name}">
+      <visual name="${name}_visual">
+        <geometry>
+          <box size="${size}"/>
+        </geometry>
+        <material name="${material}"/>
+      </visual>
+    </link>
+    <joint name="${name}_fixed" type="fixed">
+      <parent link="${parent}"/>
+      <child link="${name}"/>
+      <origin xyz="${xyz}" rpy="0 0 0"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:macro name="blindtouch_taxel_grid" params="finger">
+    <xacro:fixed_box_marker name="finger_${finger}_taxel_r0_c0" parent="finger_${finger}" xyz="-0.008 -0.015 0.018" size="0.008 0.016 0.019" material="taxel"/>
+    <xacro:fixed_box_marker name="finger_${finger}_taxel_r0_c1" parent="finger_${finger}" xyz="-0.008 0 0.018" size="0.008 0.016 0.019" material="taxel"/>
+    <xacro:fixed_box_marker name="finger_${finger}_taxel_r0_c2" parent="finger_${finger}" xyz="-0.008 0.015 0.018" size="0.008 0.016 0.019" material="taxel"/>
+    <xacro:fixed_box_marker name="finger_${finger}_taxel_r1_c0" parent="finger_${finger}" xyz="-0.008 -0.015 0" size="0.008 0.016 0.019" material="taxel"/>
+    <xacro:fixed_box_marker name="finger_${finger}_taxel_r1_c1" parent="finger_${finger}" xyz="-0.008 0 0" size="0.008 0.016 0.019" material="taxel"/>
+    <xacro:fixed_box_marker name="finger_${finger}_taxel_r1_c2" parent="finger_${finger}" xyz="-0.008 0.015 0" size="0.008 0.016 0.019" material="taxel"/>
+    <xacro:fixed_box_marker name="finger_${finger}_taxel_r2_c0" parent="finger_${finger}" xyz="-0.008 -0.015 -0.018" size="0.008 0.016 0.019" material="taxel"/>
+    <xacro:fixed_box_marker name="finger_${finger}_taxel_r2_c1" parent="finger_${finger}" xyz="-0.008 0 -0.018" size="0.008 0.016 0.019" material="taxel"/>
+    <xacro:fixed_box_marker name="finger_${finger}_taxel_r2_c2" parent="finger_${finger}" xyz="-0.008 0.015 -0.018" size="0.008 0.016 0.019" material="taxel"/>
+  </xacro:macro>
+
+  <link name="world"/>
+
+  <link name="table">
+    <xacro:visual_collision_box
+      name="table"
+      xyz="0 0 0"
+      rpy="0 0 0"
+      size="0.64 0.64 0.01"
+      material="floor"/>
+  </link>
+  <joint name="table_fixed" type="fixed">
+    <parent link="world"/>
+    <child link="table"/>
+    <origin xyz="0 0 -0.005" rpy="0 0 0"/>
+  </joint>
+
+  <link name="palm">
+    <xacro:visual_collision_cylinder
+      name="palm_shell"
+      xyz="0 0 0"
+      rpy="0 0 0"
+      radius="0.052"
+      length="0.020"
+      material="frame"/>
+    <xacro:visual_collision_cylinder
+      name="palm_cap"
+      xyz="0 0 0.012"
+      rpy="0 0 0"
+      radius="0.032"
+      length="0.008"
+      material="frame"/>
+    <xacro:visual_collision_box
+      name="finger_1_rail"
+      xyz="0.062 0 -0.018"
+      rpy="0 0 0"
+      size="0.068 0.012 0.008"
+      material="rail"/>
+    <xacro:visual_collision_box
+      name="finger_2_rail"
+      xyz="-0.031 0.053694 -0.018"
+      rpy="0 0 2.09439510239"
+      size="0.068 0.012 0.008"
+      material="rail"/>
+    <xacro:visual_collision_box
+      name="finger_3_rail"
+      xyz="-0.031 -0.053694 -0.018"
+      rpy="0 0 -2.09439510239"
+      size="0.068 0.012 0.008"
+      material="rail"/>
+    <inertial>
+      <mass value="0.25"/>
+      <inertia ixx="0.00024" ixy="0" ixz="0" iyy="0.00024" iyz="0" izz="0.00034"/>
+    </inertial>
+  </link>
+
+  <joint name="palm_lift" type="prismatic">
+    <parent link="world"/>
+    <child link="palm"/>
+    <origin xyz="0 0 0.11" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.02" upper="0.14" effort="80" velocity="0.20"/>
+  </joint>
+
+  <xacro:fixed_sphere_marker name="palm_frame" parent="palm" xyz="0 0 0" radius="0.003" material="site_green"/>
+  <xacro:fixed_sphere_marker name="grasp_center" parent="palm" xyz="0 0 -0.070" radius="0.003" material="site_yellow"/>
+
+  <xacro:macro name="blindtouch_finger" params="index x y yaw">
+    <link name="finger_${index}">
+      <xacro:visual_collision_box
+        name="finger_${index}_link"
+        xyz="0.012 0 0.042"
+        rpy="0 0 0"
+        size="0.014 0.026 0.084"
+        material="frame"/>
+      <xacro:visual_collision_box
+        name="finger_${index}_carrier"
+        xyz="0.006 0 0"
+        rpy="0 0 0"
+        size="0.008 0.052 0.062"
+        material="frame"/>
+      <xacro:visual_collision_box
+        name="finger_${index}_pad"
+        xyz="0 0 0"
+        rpy="0 0 0"
+        size="0.016 0.046 0.054"
+        material="pad"/>
+      <inertial>
+        <mass value="0.045"/>
+        <inertia ixx="0.00003" ixy="0" ixz="0" iyy="0.00003" iyz="0" izz="0.00002"/>
+      </inertial>
+    </link>
+
+    <joint name="finger_${index}_close" type="prismatic">
+      <parent link="palm"/>
+      <child link="finger_${index}"/>
+      <origin xyz="${x} ${y} -0.070" rpy="0 0 ${yaw}"/>
+      <axis xyz="-1 0 0"/>
+      <limit lower="0.0" upper="0.055" effort="15" velocity="0.20"/>
+    </joint>
+
+    <xacro:fixed_box_marker name="finger_${index}_pad_zone" parent="finger_${index}" xyz="-0.008 0 0" size="0.005 0.047 0.055" material="pad_zone"/>
+    <xacro:blindtouch_taxel_grid finger="${index}"/>
+  </xacro:macro>
+
+  <xacro:blindtouch_finger index="1" x="0.085" y="0.0" yaw="0.0"/>
+  <xacro:blindtouch_finger index="2" x="-0.0425" y="0.073612" yaw="2.09439510239"/>
+  <xacro:blindtouch_finger index="3" x="-0.0425" y="-0.073612" yaw="-2.09439510239"/>
+</robot>
