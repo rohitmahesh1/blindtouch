@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>blindtouch_bringup</name>
+  <version>0.1.0</version>
+  <description>Launch and parameter files for BlindTouch ROS systems.</description>
+  <maintainer email="maintainers@example.com">BlindTouch Maintainers</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>blindtouch_description</exec_depend>
+  <exec_depend>blindtouch_control</exec_depend>
+  <exec_depend>blindtouch_interfaces</exec_depend>
+  <exec_depend>blindtouch_sim</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
