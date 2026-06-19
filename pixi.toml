@@ -1,0 +1,44 @@
+[workspace]
+name = "blindtouch-ros"
+description = "Fedora-friendly RoboStack environment for BlindTouch ROS 2 development."
+channels = [
+  "https://prefix.dev/robostack-jazzy",
+  "https://prefix.dev/conda-forge",
+]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+compilers = "*"
+cmake = "*"
+make = "*"
+ninja = "*"
+pkg-config = "*"
+pip = "*"
+setuptools = ">=68"
+numpy = "*"
+pytest = "*"
+gymnasium = "*"
+mujoco = "*"
+ros-dev-tools = "*"
+ros-jazzy-ament-cmake = "*"
+ros-jazzy-ament-cmake-python = "*"
+ros-jazzy-joint-state-publisher-gui = "*"
+ros-jazzy-launch = "*"
+ros-jazzy-launch-ros = "*"
+ros-jazzy-rclpy = "*"
+ros-jazzy-robot-state-publisher = "*"
+ros-jazzy-ros-base = "*"
+ros-jazzy-rosidl-default-generators = "*"
+ros-jazzy-sensor-msgs = "*"
+ros-jazzy-std-msgs = "*"
+ros-jazzy-xacro = "*"
+
+[tasks]
+install-root = "python -m pip install --no-build-isolation -e .[test]"
+test-python = "python -m pytest -q"
+build-ros = "cd ros2_ws && colcon build --cmake-args -DPython3_FIND_VIRTUALENV=ONLY"
+check-ros-tools = "python -c \"import rclpy; import sensor_msgs.msg; print('rclpy ok')\" && colcon --help >/dev/null && ros2 --help >/dev/null"
+launch-sim = "mkdir -p .ros/log && bash -lc 'source ros2_ws/install/setup.bash && ROS_HOME=$PWD/.ros ROS_LOG_DIR=$PWD/.ros/log ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST ros2 launch blindtouch_sim mujoco_bridge.launch.py'"
+launch-scripted-sim = "mkdir -p .ros/log && bash -lc 'source ros2_ws/install/setup.bash && ROS_HOME=$PWD/.ros ROS_LOG_DIR=$PWD/.ros/log ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST ros2 launch blindtouch_bringup scripted_sim.launch.py'"
+launch-policy-sim = "mkdir -p .ros/log && bash -lc 'source ros2_ws/install/setup.bash && ROS_HOME=$PWD/.ros ROS_LOG_DIR=$PWD/.ros/log ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST ros2 launch blindtouch_bringup policy_sim.launch.py'"
