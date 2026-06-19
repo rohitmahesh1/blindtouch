@@ -1,0 +1,4 @@
+blindtouch_mujoco_bridge:
+  ros__parameters:
+    publish_rate_hz: 25.0
+    auto_reset: false
