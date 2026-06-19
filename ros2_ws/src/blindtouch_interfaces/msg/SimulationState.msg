@@ -1,0 +1,16 @@
+std_msgs/Header header
+uint32 step
+string phase
+string outcome
+float32 reward
+bool terminated
+bool truncated
+float32 object_height
+float32 lift_height
+float32 max_lift_height
+float32 tilt_radians
+float32 grip_score
+float32 contact_balance_score
+float32 peak_pad_force
+uint32 slip_events
+float32 cumulative_slip_distance
