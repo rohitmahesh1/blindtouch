@@ -1,0 +1,24 @@
+blindtouch_safety_filter:
+  ros__parameters:
+    input_topic: "blindtouch/raw_command"
+    output_topic: "blindtouch/command"
+    state_topic: "blindtouch/safety_state"
+    tactile_topic: "blindtouch/tactile"
+    joint_state_topic: "blindtouch/joint_states"
+    sim_state_topic: "blindtouch/sim_state"
+    tactile_force_scale: 5.0
+    velocity_scale: 0.5
+    max_episode_steps: 120
+    soft_force: 0.25
+    high_force: 0.32
+    force_rate: 0.075
+    release_action: -0.28
+    close_cap: 0.0
+    high_force_lift_cap: 0.0
+    precontact_lift_cap: 0.0
+    min_lift_contacts: 2
+    ready_force: 0.060
+    stable_steps: 2
+    contact_threshold: 0.015
+    smooth_alpha: 0.55
+    lift_cap: 0.55
